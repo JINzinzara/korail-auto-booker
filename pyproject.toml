@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "korail-auto-booker"
@@ -9,4 +9,4 @@ requires-python = ">=3.11"
 dependencies = ["korail-mobile-api @ git+https://github.com/yakisoba0728/korail-mobile-api@e798fbcf08e56297b4d16a5c300bd7a4f167722d"]
 
 [tool.setuptools]
-packages = []
+where = ["src"]
