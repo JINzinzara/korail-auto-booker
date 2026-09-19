@@ -201,6 +201,18 @@ class TripStore:
             TripStatus.RESERVED,
         )
 
+    def retry_after_reservation_failure(
+        self, attempt_id: int
+    ) -> PurchaseAttempt | None:
+        """좌석 확보 실패를 기록하고 여행을 MONITORING으로 복귀"""
+        return self._transition_attempt(
+            attempt_id,
+            AttemptStatus.RESERVING,
+            AttemptStatus.FAILED,
+            TripStatus.CLAIMING,
+            TripStatus.MONITORING,
+        )
+
     def start_payment(self, attempt_id: int) -> PurchaseAttempt | None:
         """RESERVED 구매 시도의 결제 호출을 한 번만 시작"""
         return self._transition_attempt(
