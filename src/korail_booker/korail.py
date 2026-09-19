@@ -63,9 +63,7 @@ def candidates_result(result: korail.TrainSearchResult) -> tuple[Candidate, ...]
     return tuple(candidate for candidate in candidates if candidate is not None)
 
 
-def search_candidates(
-    client: korail.KorailClient, trip: Trip
-) -> tuple[Candidate, ...]:
+def search_candidates(client: korail.KorailClient, trip: Trip) -> tuple[Candidate, ...]:
     """KORAIL 읽기 API를 한 번 호출해 예약 가능한 내부 후보를 반환"""
     return candidates_result(client.search_trains(search_query(trip)))
 
@@ -77,10 +75,7 @@ def preview_reservation(
     passengers: korail.KorailPassengerCounts,
 ) -> korail.MutationPreview:
     """후보를 다시 확인하고 전 구간 좌석 예약 요청을 전송 없이 생성"""
-    if passengers.total != trip.passenger_count:
-        raise ValueError("passenger counts must match the trip")
-    if candidate.seat_option is not SeatOption.FULL:
-        raise ValueError("merge-seat reservation is not implemented")
+    _validate_reservation(trip, candidate, passengers)
     train = _find_train(client, trip, candidate)
     if train is None:
         raise ValueError("candidate is no longer available")
@@ -94,6 +89,74 @@ def preview_reservation(
     return preview
 
 
+def reserve_and_cancel_live(
+    client: korail.KorailClient,
+    trip: Trip,
+    candidate: Candidate,
+    passengers: korail.KorailPassengerCounts,
+    max_fare_won: int,
+    *,
+    approved: bool = False,
+) -> int:
+    """명시적 승인으로 예약한 뒤 운임을 검증하고 미결제 예약은 취소"""
+    if approved is not True:
+        raise PermissionError("live reservation requires explicit approval")
+    if (
+        isinstance(max_fare_won, bool)
+        or not isinstance(max_fare_won, int)
+        or max_fare_won < 1
+    ):
+        raise ValueError("maximum fare must be a positive integer")
+    _validate_reservation(trip, candidate, passengers)
+    train = _find_train(client, trip, candidate)
+    if train is None:
+        raise ValueError("candidate is no longer available")
+    hold = client.reserve(
+        train,
+        consent=korail.MutationConsent(allow_reserve=True, dry_run=False),
+        passengers=passengers,
+    )
+    if not isinstance(hold, korail.ReservationHoldResponse) or not hold.pnr_no:
+        raise RuntimeError("live reservation did not return a reservation hold")
+
+    try:
+        detail = client.get_ticket_reservation_detail(
+            korail.TicketReservationDetailRequest(pnr_no=hold.pnr_no)
+        )
+        held_amount = _won(hold.received_amount)
+        confirmed_amount = _won(detail.total_received_amount)
+        if held_amount != confirmed_amount:
+            raise RuntimeError("reservation amounts do not match")
+        if confirmed_amount > max_fare_won:
+            raise ValueError("confirmed fare exceeds the approved maximum")
+        return confirmed_amount
+    finally:
+        try:
+            cancelled = client.cancel_unpaid_hold(
+                hold,
+                consent=korail.MutationConsent(allow_cancel=True, dry_run=False),
+            )
+        except Exception as error:
+            raise RuntimeError("failed to cancel the unpaid reservation") from error
+        if (
+            not isinstance(cancelled, korail.BaseKorailResponse)
+            or cancelled.str_result != "SUCC"
+        ):
+            raise RuntimeError("failed to confirm unpaid reservation cancellation")
+
+
+def _validate_reservation(
+    trip: Trip,
+    candidate: Candidate,
+    passengers: korail.KorailPassengerCounts,
+) -> None:
+    """여행 인원수와 구현된 좌석 유형만 예약 입력으로 허용"""
+    if passengers.total != trip.passenger_count:
+        raise ValueError("passenger counts must match the trip")
+    if candidate.seat_option is not SeatOption.FULL:
+        raise ValueError("merge-seat reservation is not implemented")
+
+
 def _find_train(
     client: korail.KorailClient, trip: Trip, candidate: Candidate
 ) -> korail.TrainSummary | None:
@@ -103,6 +166,13 @@ def _find_train(
         if train_candidate(train) == candidate:
             return train
     return None
+
+
+def _won(value: str | None) -> int:
+    """KORAIL 금액 문자열을 검증해 정수로 변환"""
+    if not value or not value.isdecimal() or int(value) < 1:
+        raise RuntimeError("KORAIL returned an invalid fare amount")
+    return int(value)
 
 
 def _schedule_datetime(date_value: str | None, time_value: str | None) -> datetime:

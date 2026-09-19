@@ -14,6 +14,7 @@ from korail_booker.korail import (
     create_client,
     login_client,
     preview_reservation,
+    reserve_and_cancel_live,
     search_candidates,
     search_query,
     train_candidate,
@@ -212,6 +213,111 @@ class KorailGatewayTest(unittest.TestCase):
             passengers=passengers,
         )
         self.assertEqual(result.note, "dry-run: not sent")
+
+    def test_live_reservation_requires_explicit_approval(self) -> None:
+        """승인 없는 실예약 요청이 조회 전부터 차단되는지 확인"""
+        client = Mock(spec=korail.KorailClient)
+
+        with self.assertRaisesRegex(PermissionError, "explicit approval"):
+            reserve_and_cancel_live(
+                client,
+                make_trip(),
+                train_candidate(make_train()),
+                korail.KorailPassengerCounts(adult=2),
+                120_000,
+            )
+
+        show_flow(
+            "실예약 승인 차단",
+            "입력: approved=False",
+            "출력: 외부 API 호출 0회, PermissionError",
+        )
+        client.search_trains.assert_not_called()
+        client.reserve.assert_not_called()
+
+    def test_live_reservation_confirms_fare_and_cancels(self) -> None:
+        """실예약 금액을 상세 조회와 대조한 뒤 미결제 예약을 취소하는지 확인"""
+        trip = make_trip()
+        train = make_train()
+        candidate = train_candidate(train)
+        passengers = korail.KorailPassengerCounts(adult=2)
+        hold = korail.ReservationHoldResponse(
+            pnr_no="hidden", received_amount="118000"
+        )
+        client = Mock(spec=korail.KorailClient)
+        client.search_trains.return_value = korail.TrainSearchResult(
+            trains=[train], response=korail.BaseKorailResponse()
+        )
+        client.reserve.return_value = hold
+        client.get_ticket_reservation_detail.return_value = (
+            korail.TicketReservationDetailResponse(total_received_amount="000118000")
+        )
+        client.cancel_unpaid_hold.return_value = korail.BaseKorailResponse(
+            str_result="SUCC"
+        )
+
+        fare = reserve_and_cancel_live(
+            client,
+            trip,
+            candidate,
+            passengers,
+            120_000,
+            approved=True,
+        )
+
+        show_flow(
+            "실예약 안전 점검",
+            "입력: KTX 001, 승인 상한 120,000원",
+            f"출력: 확정 운임 {fare:,}원",
+            "복구: 결제 없이 예약 취소 확인",
+        )
+        client.reserve.assert_called_once_with(
+            train,
+            consent=korail.MutationConsent(allow_reserve=True, dry_run=False),
+            passengers=passengers,
+        )
+        client.cancel_unpaid_hold.assert_called_once_with(
+            hold,
+            consent=korail.MutationConsent(allow_cancel=True, dry_run=False),
+        )
+        self.assertEqual(fare, 118_000)
+
+    def test_live_reservation_cancels_when_fare_exceeds_limit(self) -> None:
+        """확정 운임이 승인 상한을 넘더라도 미결제 예약을 취소하는지 확인"""
+        trip = make_trip()
+        train = make_train()
+        hold = korail.ReservationHoldResponse(
+            pnr_no="hidden", received_amount="118000"
+        )
+        client = Mock(spec=korail.KorailClient)
+        client.search_trains.return_value = korail.TrainSearchResult(
+            trains=[train], response=korail.BaseKorailResponse()
+        )
+        client.reserve.return_value = hold
+        client.get_ticket_reservation_detail.return_value = (
+            korail.TicketReservationDetailResponse(total_received_amount="118000")
+        )
+        client.cancel_unpaid_hold.return_value = korail.BaseKorailResponse(
+            str_result="SUCC"
+        )
+
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            reserve_and_cancel_live(
+                client,
+                trip,
+                train_candidate(train),
+                korail.KorailPassengerCounts(adult=2),
+                100_000,
+                approved=True,
+            )
+
+        show_flow(
+            "운임 상한 초과 복구",
+            "입력: 확정 118,000원, 승인 상한 100,000원",
+            "출력: 결제 차단, ValueError",
+            "복구: 미결제 예약 취소 확인",
+        )
+        client.cancel_unpaid_hold.assert_called_once()
 
 
 if __name__ == "__main__":
