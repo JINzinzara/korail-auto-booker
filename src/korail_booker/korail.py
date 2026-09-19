@@ -131,7 +131,9 @@ def reserve_live(
     *,
     approved: bool = False,
 ) -> Reservation:
+) -> Reservation:
     """명시적 승인과 운임 상한을 확인하고 결제 전 실예약을 반환"""
+    hold, confirmed_amount = _reserve_live(
     hold, confirmed_amount = _reserve_live(
         client,
         trip,
@@ -145,20 +147,28 @@ def reserve_live(
     except Exception:
         _cancel_unpaid(client, hold)
         raise
+    try:
+        return _reservation_from_hold(hold, confirmed_amount)
+    except Exception:
+        _cancel_unpaid(client, hold)
+        raise
 
 
 def pay_reservation_live(
     client: korail.KorailClient,
+    reservation: Reservation,
     reservation: Reservation,
     card: korail.CardPayment,
     max_fare_won: int,
     *,
     real_charge_approved: bool = False,
 ) -> bool:
+) -> bool:
     """실카드 일회성 승인과 운임 재검증 뒤 예약을 한 번 결제"""
     if real_charge_approved is not True:
         raise PermissionError("real-card payment requires explicit approval")
     _validate_max_fare(max_fare_won)
+    hold = _hold_from_reservation(reservation)
     hold = _hold_from_reservation(reservation)
     try:
         _confirmed_fare(client, hold, max_fare_won)
@@ -178,9 +188,13 @@ def pay_reservation_live(
         )
     except Exception as error:
         raise PaymentOutcomeUnknownError(
+        raise PaymentOutcomeUnknownError(
             "payment outcome is unknown; reconcile before retrying"
         ) from error
     if not isinstance(response, korail.ReservationPaymentResponse):
+        raise PaymentOutcomeUnknownError(
+            "payment outcome is unknown; reconcile before retrying"
+        )
         raise PaymentOutcomeUnknownError(
             "payment outcome is unknown; reconcile before retrying"
         )
@@ -188,8 +202,11 @@ def pay_reservation_live(
         _cancel_unpaid(client, hold)
         return False
     return True
+        return False
+    return True
 
 
+def ticket_is_issued(client: korail.KorailClient, reservation: Reservation) -> bool:
 def ticket_is_issued(client: korail.KorailClient, reservation: Reservation) -> bool:
     """현재 승차권 목록에서 지정 예약번호의 발권 여부를 확인"""
     return _pnr_present(client.get_ticket_list().raw, reservation.reference)
@@ -292,6 +309,41 @@ def _confirmed_fare(
     if confirmed_amount > max_fare_won:
         raise ValueError("confirmed fare exceeds the approved maximum")
     return confirmed_amount
+
+
+def _reservation_from_hold(
+    hold: korail.ReservationHoldResponse, confirmed_amount: int
+) -> Reservation:
+    """KORAIL 예약 응답을 재시작 가능한 내부 예약으로 변환"""
+    if not hold.pnr_no or not hold.window_no:
+        raise RuntimeError("reservation hold lacks payment identifiers")
+    change_no = hold.journeys[0].reservation_change_no if hold.journeys else None
+    return Reservation(
+        reference=hold.pnr_no,
+        amount=confirmed_amount,
+        window_no=hold.window_no,
+        job_sequence_1=hold.temporary_job_sequence_1 or None,
+        job_sequence_2=hold.temporary_job_sequence_2 or None,
+        change_no=change_no or None,
+    )
+
+
+def _hold_from_reservation(reservation: Reservation) -> korail.ReservationHoldResponse:
+    """저장된 내부 예약을 KORAIL 결제 입력으로 복원"""
+    journeys = (
+        (korail.ReservationJourney(reservation_change_no=reservation.change_no),)
+        if reservation.change_no is not None
+        else ()
+    )
+    return korail.ReservationHoldResponse(
+        str_result="SUCC",
+        pnr_no=reservation.reference,
+        window_no=reservation.window_no,
+        temporary_job_sequence_1=reservation.job_sequence_1,
+        temporary_job_sequence_2=reservation.job_sequence_2,
+        received_amount=str(reservation.amount),
+        journeys=journeys,
+    )
 
 
 def _reservation_from_hold(
