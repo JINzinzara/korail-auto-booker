@@ -1,5 +1,6 @@
 """조회부터 발권 확인까지 한 번의 테스트용 구매 흐름을 조정"""
 
+import time
 from collections.abc import Callable, Iterable
 
 from .domain import AttemptStatus, Candidate, PurchaseAttempt, Trip, TripStatus
@@ -30,11 +31,13 @@ class BookingWorker:
         trip = self.store.get_trip(trip_id)
         if trip is None or trip.status is not TripStatus.MONITORING:
             return None
-        candidate = pick_candidate(trip, self.search(trip))
-        if candidate is None:
-            return None
-        claimed = self.store.claim_candidate(trip_id, candidate)
-        if claimed is None:
+        candidates = list(self.search(trip))
+        while (candidate := pick_candidate(trip, candidates)) is not None:
+            claimed = self.store.claim_candidate(trip_id, candidate)
+            if claimed is not None:
+                break
+            candidates.remove(candidate)
+        else:
             return None
         reserving = self.store.start_reservation(claimed.id)
         if reserving is None:
@@ -56,6 +59,61 @@ class BookingWorker:
         if reconciling is None:
             return None
         return self.reconcile(claimed.id)
+
+    def poll(
+        self,
+        trip_id: int,
+        interval_seconds: float = 10,
+        *,
+        max_polls: int | None = None,
+        stop_requested: Callable[[], bool] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> PurchaseAttempt | None:
+        """안전한 간격으로 조회하며 발권, 중지 또는 횟수 제한까지 진행"""
+        if interval_seconds < 5:
+            raise ValueError("poll interval must be at least 5 seconds")
+        if max_polls is not None and max_polls < 1:
+            raise ValueError("max polls must be positive")
+
+        attempt = self.store.get_active_attempt(trip_id)
+        polls = 0
+        while max_polls is None or polls < max_polls:
+            trip = self.store.get_trip(trip_id)
+            if trip is None:
+                return None
+            if trip.status is TripStatus.MONITORING:
+                if stop_requested is not None and stop_requested():
+                    self.store.stop_trip(trip_id)
+                    return None
+                try:
+                    attempt = self.run_once(trip_id)
+                except Exception:
+                    attempt = self.store.get_active_attempt(trip_id)
+                    if (
+                        attempt is None
+                        or attempt.status is not AttemptStatus.RECONCILING
+                    ):
+                        raise
+            elif trip.status is TripStatus.RECONCILING:
+                attempt = attempt or self.store.get_active_attempt(trip_id)
+                if attempt is None:
+                    return None
+                attempt = self.reconcile(attempt.id)
+            else:
+                return attempt
+
+            polls += 1
+            trip = self.store.get_trip(trip_id)
+            if attempt is not None and attempt.status is AttemptStatus.TICKETED:
+                return attempt
+            if trip is None or trip.status not in {
+                TripStatus.MONITORING,
+                TripStatus.RECONCILING,
+            }:
+                return attempt
+            if max_polls is None or polls < max_polls:
+                sleep(interval_seconds)
+        return attempt
 
     def reconcile(self, attempt_id: int) -> PurchaseAttempt | None:
         """RECONCILING 구매 시도의 승차권을 확인하고 성공만 TICKETED로 전환"""

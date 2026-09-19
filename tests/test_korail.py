@@ -4,12 +4,14 @@ import sys
 import unittest
 from dataclasses import replace
 from datetime import date, datetime, time
+from unittest.mock import Mock
 
 import korail_mobile_api as korail
 
 from korail_booker.domain import SeatOption, Trip
 from korail_booker.korail import (
     candidates_result,
+    search_candidates,
     search_query,
     train_candidate,
 )
@@ -123,6 +125,26 @@ class KorailGatewayTest(unittest.TestCase):
         )
         self.assertEqual(candidate.departure_at, datetime(2026, 10, 1, 23, 50))
         self.assertEqual(candidate.arrival_at, datetime(2026, 10, 2, 1, 30))
+
+    def test_search_candidates_calls_read_api(self) -> None:
+        """실제 client 연결 함수가 읽기 API 결과만 내부 후보로 변환하는지 확인"""
+        trip = make_trip()
+        client = Mock(spec=korail.KorailClient)
+        client.search_trains.return_value = korail.TrainSearchResult(
+            trains=[make_train()],
+            response=korail.BaseKorailResponse(),
+        )
+
+        candidates = search_candidates(client, trip)
+
+        show_flow(
+            "온라인 조회 연결",
+            "입력: 서울 → 부산 여행 조건",
+            "호출: KorailClient.search_trains 1회",
+            f"출력: {candidates[0].train_no} {candidates[0].seat_option}",
+        )
+        client.search_trains.assert_called_once_with(search_query(trip))
+        self.assertEqual(candidates[0].train_no, "001")
 
 
 if __name__ == "__main__":

@@ -51,6 +51,13 @@ def candidates_result(result: korail.TrainSearchResult) -> tuple[Candidate, ...]
     return tuple(candidate for candidate in candidates if candidate is not None)
 
 
+def search_candidates(
+    client: korail.KorailClient, trip: Trip
+) -> tuple[Candidate, ...]:
+    """KORAIL 읽기 API를 한 번 호출해 예약 가능한 내부 후보를 반환"""
+    return candidates_result(client.search_trains(search_query(trip)))
+
+
 def _schedule_datetime(date_value: str | None, time_value: str | None) -> datetime:
     """KORAIL 날짜와 시각 문자열을 로컬 datetime으로 변환"""
     if not date_value or not time_value:

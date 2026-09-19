@@ -138,12 +138,38 @@ class TripStore:
             ),
         )
 
+    def get_active_attempt(self, trip_id: int) -> PurchaseAttempt | None:
+        """여행의 완료되지 않은 구매 시도를 조회하고 없으면 None"""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id FROM purchase_attempts
+                WHERE trip_id = ? AND status NOT IN (?, ?)
+                ORDER BY id DESC LIMIT 1
+                """,
+                (
+                    trip_id,
+                    AttemptStatus.TICKETED.value,
+                    AttemptStatus.FAILED.value,
+                ),
+            ).fetchone()
+        return self.get_attempt(row[0]) if row is not None else None
+
     def start_trip(self, trip_id: int) -> bool:
         """DRAFT 여행을 MONITORING으로 한 번만 전환"""
         with self._connect() as connection:
             cursor = connection.execute(
                 "UPDATE trips SET status = ? WHERE id = ? AND status = ?",
                 (TripStatus.MONITORING.value, trip_id, TripStatus.DRAFT.value),
+            )
+        return cursor.rowcount == 1
+
+    def stop_trip(self, trip_id: int) -> bool:
+        """아직 구매를 시작하지 않은 MONITORING 여행을 STOPPED로 전환"""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE trips SET status = ? WHERE id = ? AND status = ?",
+                (TripStatus.STOPPED.value, trip_id, TripStatus.MONITORING.value),
             )
         return cursor.rowcount == 1
 
@@ -154,6 +180,15 @@ class TripStore:
         now = datetime.now(timezone.utc)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            duplicate = connection.execute(
+                """
+                SELECT 1 FROM purchase_attempts
+                WHERE trip_id = ? AND candidate_key = ?
+                """,
+                (trip_id, candidate.key),
+            ).fetchone()
+            if duplicate is not None:
+                return None
             claimed = connection.execute(
                 "UPDATE trips SET status = ? WHERE id = ? AND status = ?",
                 (TripStatus.CLAIMING.value, trip_id, TripStatus.MONITORING.value),
