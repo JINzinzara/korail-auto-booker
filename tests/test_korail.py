@@ -11,6 +11,7 @@ import korail_mobile_api as korail
 from korail_booker.domain import SeatOption, Trip
 from korail_booker.korail import (
     candidates_result,
+    create_client,
     search_candidates,
     search_query,
     train_candidate,
@@ -56,6 +57,19 @@ def make_train(**changes: object) -> korail.TrainSummary:
 
 class KorailGatewayTest(unittest.TestCase):
     """외부 조회 계약이 내부 계약으로 안전하게 변환되는지 확인"""
+
+    def test_create_client_enables_dynapath(self) -> None:
+        """라이브 client가 DynaPath를 명시적으로 활성화하는지 확인"""
+        client = create_client()
+        try:
+            show_flow(
+                "라이브 client 보안 설정",
+                "입력: create_client()",
+                f"출력 DynaPath 활성화: {client.config.dynapath.enabled}",
+            )
+            self.assertTrue(client.config.dynapath.enabled)
+        finally:
+            client.close()
 
     def test_search_query(self) -> None:
         """여행의 역, 날짜, 시작시각, 승객 수를 조회에 반영하는지 확인"""

@@ -1,10 +1,15 @@
-"""KORAIL 공개 조회 모델을 내부 여행 후보로 변환"""
+"""DynaPath 사용 KORAIL 조회와 내부 여행 후보 변환"""
 
 from datetime import datetime, timedelta
 
 import korail_mobile_api as korail
 
 from .domain import Candidate, SeatOption, Trip
+
+
+def create_client() -> korail.KorailClient:
+    """라이브러리 지원 DynaPath를 활성화한 KORAIL client 생성"""
+    return korail.KorailClient(korail.KorailConfig(enable_dynapath=True))
 
 
 def search_query(trip: Trip) -> korail.TrainSearchQuery:
