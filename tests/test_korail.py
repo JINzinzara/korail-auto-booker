@@ -13,8 +13,10 @@ from korail_booker.korail import (
     candidates_result,
     create_client,
     login_client,
+    pay_reservation_live,
     preview_reservation,
     reserve_and_cancel_live,
+    ticket_is_issued,
     search_candidates,
     search_query,
     train_candidate,
@@ -56,6 +58,23 @@ def make_train(**changes: object) -> korail.TrainSummary:
         general_reservation_code="11",
     )
     return replace(train, **changes)
+
+
+def make_hold() -> korail.ReservationHoldResponse:
+    """결제 테스트에 사용할 식별값 비공개 미결제 예약 생성"""
+    return korail.ReservationHoldResponse(
+        pnr_no="hidden", received_amount="118000"
+    )
+
+
+def make_card() -> korail.CardPayment:
+    """네트워크로 전송되지 않는 결제 테스트용 카드 입력 생성"""
+    return korail.CardPayment(
+        card_number="0",
+        card_password="00",
+        card_expire="0000",
+        birthday="000000",
+    )
 
 
 class KorailGatewayTest(unittest.TestCase):
@@ -318,6 +337,121 @@ class KorailGatewayTest(unittest.TestCase):
             "복구: 미결제 예약 취소 확인",
         )
         client.cancel_unpaid_hold.assert_called_once()
+
+    def test_live_payment_requires_explicit_charge_approval(self) -> None:
+        """실카드 결제 승인이 없으면 조회와 결제를 모두 차단하는지 확인"""
+        client = Mock(spec=korail.KorailClient)
+
+        with self.assertRaisesRegex(PermissionError, "explicit approval"):
+            pay_reservation_live(client, make_hold(), make_card(), 120_000)
+
+        show_flow(
+            "실결제 승인 차단",
+            "입력: real_charge_approved=False",
+            "출력: 외부 API 호출 0회, PermissionError",
+        )
+        client.get_ticket_reservation_detail.assert_not_called()
+        client.pay_with_card.assert_not_called()
+
+    def test_live_payment_rechecks_fare_and_verifies_ticket(self) -> None:
+        """결제 직전 운임을 재검증하고 발권을 별도 조회하는지 확인"""
+        hold = make_hold()
+        card = make_card()
+        payment = korail.ReservationPaymentResponse(str_result="SUCC")
+        client = Mock(spec=korail.KorailClient)
+        client.get_ticket_reservation_detail.return_value = (
+            korail.TicketReservationDetailResponse(total_received_amount="000118000")
+        )
+        client.pay_with_card.return_value = payment
+        client.get_ticket_list.return_value = korail.BaseKorailResponse(
+            raw={"tickets": [{"h_pnr_no": "hidden"}]}
+        )
+
+        result = pay_reservation_live(
+            client,
+            hold,
+            card,
+            120_000,
+            real_charge_approved=True,
+        )
+        issued = ticket_is_issued(client, hold.pnr_no)
+
+        show_flow(
+            "실결제 및 발권 확인",
+            "입력: 확정 118,000원, 승인 상한 120,000원, 일회성 실결제 승인",
+            "호출: 상세 운임 재조회 → 실결제 1회 → 승차권 목록 조회",
+            f"출력: 결제={result.str_result}, 발권={issued}",
+            "카드정보·예약번호 출력: 없음",
+        )
+        client.pay_with_card.assert_called_once_with(
+            hold,
+            card,
+            consent=korail.MutationConsent(
+                allow_payment=True,
+                dry_run=False,
+                fake_card_only=False,
+                real_card_acknowledged=True,
+            ),
+        )
+        self.assertTrue(issued)
+
+    def test_declined_payment_cancels_unpaid_reservation(self) -> None:
+        """결제 거절 응답이면 미결제 상태를 확인해 예약을 취소하는지 확인"""
+        hold = make_hold()
+        client = Mock(spec=korail.KorailClient)
+        client.get_ticket_reservation_detail.return_value = (
+            korail.TicketReservationDetailResponse(total_received_amount="118000")
+        )
+        client.pay_with_card.return_value = korail.ReservationPaymentResponse(
+            str_result="FAIL"
+        )
+        client.cancel_unpaid_hold.return_value = korail.BaseKorailResponse(
+            str_result="SUCC"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "declined"):
+            pay_reservation_live(
+                client,
+                hold,
+                make_card(),
+                120_000,
+                real_charge_approved=True,
+            )
+
+        show_flow(
+            "결제 거절 복구",
+            "입력: 서버 결제 결과=FAIL",
+            "출력: 결제 실패 명시",
+            "복구: 미결제 예약 취소 확인",
+        )
+        client.cancel_unpaid_hold.assert_called_once()
+
+    def test_unknown_payment_outcome_is_not_retried_or_cancelled(self) -> None:
+        """결제 응답이 불명확하면 재결제나 취소 없이 조회 복구로 넘기는지 확인"""
+        hold = make_hold()
+        client = Mock(spec=korail.KorailClient)
+        client.get_ticket_reservation_detail.return_value = (
+            korail.TicketReservationDetailResponse(total_received_amount="118000")
+        )
+        client.pay_with_card.side_effect = TimeoutError("response unavailable")
+
+        with self.assertRaisesRegex(RuntimeError, "outcome is unknown"):
+            pay_reservation_live(
+                client,
+                hold,
+                make_card(),
+                120_000,
+                real_charge_approved=True,
+            )
+
+        show_flow(
+            "결제 결과 불명확",
+            "입력: 결제 전송 뒤 TimeoutError",
+            "출력: 결과 불명확, 조회 복구 필요",
+            "안전조치: 재결제 0회, 자동취소 0회",
+        )
+        self.assertEqual(client.pay_with_card.call_count, 1)
+        client.cancel_unpaid_hold.assert_not_called()
 
 
 if __name__ == "__main__":

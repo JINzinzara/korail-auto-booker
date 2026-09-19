@@ -99,14 +99,101 @@ def reserve_and_cancel_live(
     approved: bool = False,
 ) -> int:
     """명시적 승인으로 예약한 뒤 운임을 검증하고 미결제 예약은 취소"""
+    hold, confirmed_amount = _reserve_live(
+        client,
+        trip,
+        candidate,
+        passengers,
+        max_fare_won,
+        approved=approved,
+    )
+    try:
+        return confirmed_amount
+    finally:
+        _cancel_unpaid(client, hold)
+
+
+def reserve_live(
+    client: korail.KorailClient,
+    trip: Trip,
+    candidate: Candidate,
+    passengers: korail.KorailPassengerCounts,
+    max_fare_won: int,
+    *,
+    approved: bool = False,
+) -> korail.ReservationHoldResponse:
+    """명시적 승인과 운임 상한을 확인하고 결제 전 실예약을 반환"""
+    hold, _ = _reserve_live(
+        client,
+        trip,
+        candidate,
+        passengers,
+        max_fare_won,
+        approved=approved,
+    )
+    return hold
+
+
+def pay_reservation_live(
+    client: korail.KorailClient,
+    hold: korail.ReservationHoldResponse,
+    card: korail.CardPayment,
+    max_fare_won: int,
+    *,
+    real_charge_approved: bool = False,
+) -> korail.ReservationPaymentResponse:
+    """실카드 일회성 승인과 운임 재검증 뒤 예약을 한 번 결제"""
+    if real_charge_approved is not True:
+        raise PermissionError("real-card payment requires explicit approval")
+    _validate_max_fare(max_fare_won)
+    try:
+        _confirmed_fare(client, hold, max_fare_won)
+    except Exception:
+        _cancel_unpaid(client, hold)
+        raise
+    try:
+        response = client.pay_with_card(
+            hold,
+            card,
+            consent=korail.MutationConsent(
+                allow_payment=True,
+                dry_run=False,
+                fake_card_only=False,
+                real_card_acknowledged=True,
+            ),
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "payment outcome is unknown; reconcile before retrying"
+        ) from error
+    if not isinstance(response, korail.ReservationPaymentResponse):
+        raise RuntimeError("payment outcome is unknown; reconcile before retrying")
+    if response.str_result != "SUCC":
+        _cancel_unpaid(client, hold)
+        raise RuntimeError("payment was declined; unpaid reservation cancelled")
+    return response
+
+
+def ticket_is_issued(client: korail.KorailClient, pnr_no: str) -> bool:
+    """현재 승차권 목록에서 지정 예약번호의 발권 여부를 확인"""
+    if not pnr_no:
+        raise ValueError("reservation number is required")
+    return _pnr_present(client.get_ticket_list().raw, pnr_no)
+
+
+def _reserve_live(
+    client: korail.KorailClient,
+    trip: Trip,
+    candidate: Candidate,
+    passengers: korail.KorailPassengerCounts,
+    max_fare_won: int,
+    *,
+    approved: bool,
+) -> tuple[korail.ReservationHoldResponse, int]:
+    """실예약을 만들고 금액 검증 실패 시 즉시 취소"""
     if approved is not True:
         raise PermissionError("live reservation requires explicit approval")
-    if (
-        isinstance(max_fare_won, bool)
-        or not isinstance(max_fare_won, int)
-        or max_fare_won < 1
-    ):
-        raise ValueError("maximum fare must be a positive integer")
+    _validate_max_fare(max_fare_won)
     _validate_reservation(trip, candidate, passengers)
     train = _find_train(client, trip, candidate)
     if train is None:
@@ -118,31 +205,70 @@ def reserve_and_cancel_live(
     )
     if not isinstance(hold, korail.ReservationHoldResponse) or not hold.pnr_no:
         raise RuntimeError("live reservation did not return a reservation hold")
-
     try:
-        detail = client.get_ticket_reservation_detail(
-            korail.TicketReservationDetailRequest(pnr_no=hold.pnr_no)
+        return hold, _confirmed_fare(client, hold, max_fare_won)
+    except Exception:
+        _cancel_unpaid(client, hold)
+        raise
+
+
+def _confirmed_fare(
+    client: korail.KorailClient,
+    hold: korail.ReservationHoldResponse,
+    max_fare_won: int,
+) -> int:
+    """예약 응답과 상세 조회 금액이 같고 승인 상한 이하인지 확인"""
+    if not hold.pnr_no:
+        raise RuntimeError("reservation hold has no reservation number")
+    detail = client.get_ticket_reservation_detail(
+        korail.TicketReservationDetailRequest(pnr_no=hold.pnr_no)
+    )
+    held_amount = _won(hold.received_amount)
+    confirmed_amount = _won(detail.total_received_amount)
+    if held_amount != confirmed_amount:
+        raise RuntimeError("reservation amounts do not match")
+    if confirmed_amount > max_fare_won:
+        raise ValueError("confirmed fare exceeds the approved maximum")
+    return confirmed_amount
+
+
+def _cancel_unpaid(
+    client: korail.KorailClient, hold: korail.ReservationHoldResponse
+) -> None:
+    """미결제 예약을 취소하고 서버 성공 응답까지 확인"""
+    try:
+        cancelled = client.cancel_unpaid_hold(
+            hold,
+            consent=korail.MutationConsent(allow_cancel=True, dry_run=False),
         )
-        held_amount = _won(hold.received_amount)
-        confirmed_amount = _won(detail.total_received_amount)
-        if held_amount != confirmed_amount:
-            raise RuntimeError("reservation amounts do not match")
-        if confirmed_amount > max_fare_won:
-            raise ValueError("confirmed fare exceeds the approved maximum")
-        return confirmed_amount
-    finally:
-        try:
-            cancelled = client.cancel_unpaid_hold(
-                hold,
-                consent=korail.MutationConsent(allow_cancel=True, dry_run=False),
-            )
-        except Exception as error:
-            raise RuntimeError("failed to cancel the unpaid reservation") from error
-        if (
-            not isinstance(cancelled, korail.BaseKorailResponse)
-            or cancelled.str_result != "SUCC"
-        ):
-            raise RuntimeError("failed to confirm unpaid reservation cancellation")
+    except Exception as error:
+        raise RuntimeError("failed to cancel the unpaid reservation") from error
+    if (
+        not isinstance(cancelled, korail.BaseKorailResponse)
+        or cancelled.str_result != "SUCC"
+    ):
+        raise RuntimeError("failed to confirm unpaid reservation cancellation")
+
+
+def _validate_max_fare(max_fare_won: int) -> None:
+    """승인 운임 상한이 양의 정수인지 확인"""
+    if (
+        isinstance(max_fare_won, bool)
+        or not isinstance(max_fare_won, int)
+        or max_fare_won < 1
+    ):
+        raise ValueError("maximum fare must be a positive integer")
+
+
+def _pnr_present(raw: object, pnr_no: str) -> bool:
+    """중첩된 승차권 응답에서 지정 예약번호를 재귀적으로 탐색"""
+    if isinstance(raw, dict):
+        if raw.get("h_pnr_no") == pnr_no or raw.get("pnrNo") == pnr_no:
+            return True
+        return any(_pnr_present(value, pnr_no) for value in raw.values())
+    if isinstance(raw, list):
+        return any(_pnr_present(value, pnr_no) for value in raw)
+    return False
 
 
 def _validate_reservation(
