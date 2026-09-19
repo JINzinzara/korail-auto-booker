@@ -1,6 +1,6 @@
 """외부 API와 분리된 여행 및 구매 시도 계약"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from enum import StrEnum
 
@@ -30,6 +30,10 @@ class AttemptStatus(StrEnum):
 class SeatOption(StrEnum):
     FULL = "FULL"
     MERGE = "MERGE"
+
+
+class PaymentOutcomeUnknownError(RuntimeError):
+    """결제 전송 후 서버 결과를 확정할 수 없음을 표시"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +124,30 @@ class Candidate:
 
 
 @dataclass(frozen=True, slots=True)
+class Reservation:
+    reference: str = field(repr=False)
+    amount: int
+    window_no: str = field(repr=False)
+    job_sequence_1: str | None = field(default=None, repr=False)
+    job_sequence_2: str | None = field(default=None, repr=False)
+    change_no: str | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        """결제 재개에 필요한 최소 예약 식별값과 운임 검증"""
+        if not isinstance(self.reference, str) or not self.reference.strip():
+            raise ValueError("reservation reference is required")
+        if isinstance(self.amount, bool) or not isinstance(self.amount, int):
+            raise ValueError("reservation amount must be an integer")
+        if self.amount < 1:
+            raise ValueError("reservation amount must be positive")
+        if not isinstance(self.window_no, str) or not self.window_no.strip():
+            raise ValueError("reservation window number is required")
+        for value in (self.job_sequence_1, self.job_sequence_2, self.change_no):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError("optional reservation identifiers must be non-empty")
+
+
+@dataclass(frozen=True, slots=True)
 class PurchaseAttempt:
     trip_id: int
     candidate_key: str
@@ -128,6 +156,7 @@ class PurchaseAttempt:
     created_at: datetime | None = None
     reserve_attempted_at: datetime | None = None
     payment_attempted_at: datetime | None = None
+    reservation: Reservation | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """구매 시도 식별값과 예약·결제 순서의 불변조건 검증"""
@@ -147,3 +176,15 @@ class PurchaseAttempt:
             raise ValueError("attempt id must be positive")
         if self.payment_attempted_at is not None and self.reserve_attempted_at is None:
             raise ValueError("payment requires a recorded reservation attempt")
+        requires_reservation = self.status in {
+            AttemptStatus.RESERVED,
+            AttemptStatus.PAYING,
+            AttemptStatus.RECONCILING,
+            AttemptStatus.TICKETED,
+        }
+        if requires_reservation and self.reservation is None:
+            raise ValueError("purchase status requires a reservation")
+        if self.status in {AttemptStatus.CLAIMED, AttemptStatus.RESERVING} and (
+            self.reservation is not None
+        ):
+            raise ValueError("reservation is premature for purchase status")
