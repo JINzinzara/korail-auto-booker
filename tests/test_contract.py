@@ -1,4 +1,4 @@
-"""KORAIL 라이브러리의 필수 계약 확인"""
+"""고정된 KORAIL 라이브러리의 필수 공개 계약 확인"""
 
 import inspect
 import tomllib
@@ -13,17 +13,17 @@ PINNED_COMMIT = (
 
 
 class ContractTest(unittest.TestCase):
-    """업데이트로 핵심 API가 변경되는 것을 감지"""
+    """업데이트로 핵심 API의 변경 감지"""
 
     def test_dependency_pin(self) -> None:
-        # 설치 대상 commit과 라이브러리의 버전 고정
+        """설치 대상 커밋과 라이브러리 버전이 고정됐는지 확인한다."""
         project = tomllib.loads(Path("pyproject.toml").read_text())
         dependency = project["project"]["dependencies"][0]
         self.assertTrue(dependency.endswith(PINNED_COMMIT))
         self.assertEqual(korail.__version__, "1.1.1")
 
     def test_public_api(self) -> None:
-        # 로그인부터 발권 확인까지 필요한 공개 매서드 고정
+        """로그인부터 발권 확인까지 필요한 공개 메서드 확인"""
         methods = {
             "login",
             "logout",
@@ -33,7 +33,7 @@ class ContractTest(unittest.TestCase):
             "reserve",
             "reserve_merge",
             "cancel_unpaid_hold",
-            "pay_with card",
+            "pay_with_card",
             "get_reservation_history",
             "get_ticket_list",
             "get_ticket_reservation_detail",
@@ -41,7 +41,7 @@ class ContractTest(unittest.TestCase):
         self.assertFalse(methods - set(dir(korail.KorailClient)))
 
     def test_consent_required(self) -> None:
-        # 모든 상태 변경을 키워드 동의 필요
+        """모든 상태 변경 메서드의 명시적 키워드 동의 요구 확인"""
         methods = (
             "reserve",
             "reserve_merge",
@@ -55,10 +55,10 @@ class ContractTest(unittest.TestCase):
             self.assertIn("consent", parameters)
             consent = parameters["consent"]
             self.assertEqual(consent.kind, inspect.Parameter.KEYWORD_ONLY)
-            self.assertIn(consent.default, inspect.Parameter.empty)
+            self.assertIs(consent.default, inspect.Parameter.empty)
 
     def test_mutation_guard(self) -> None:
-        # 기본 동의로는 어떤 상태 변경도 불가능
+        """기본 동의 객체의 모든 상태 변경 차단 확인"""
         consent = korail.MutationConsent()
         self.assertTrue(consent.dry_run)
         self.assertTrue(consent.fake_card_only)
@@ -68,16 +68,16 @@ class ContractTest(unittest.TestCase):
                 korail.require_mutation_consent(consent, category)
 
     def test_seat_contract(self) -> None:
-        # 일반 좌석과 좌석 + 입석 예약 코드 고정
-        self.assertEqual(korail.KorailResercationJobType.IMMEDIATE.vlaue, "1101")
+        """전 구간 좌석과 좌석+입석 예약 코드 확인"""
+        self.assertEqual(korail.KorailReservationJobType.IMMEDIATE.value, "1101")
         self.assertEqual(korail.KorailReservationJobType.MERGE_STANDING.value, "1202")
         self.assertEqual(
-            korail.KORAIL_MERGE_FLAGS_BY_CABIN,
+            korail.KORAIL_MERGE_SEAT_FLAGS_BY_CABIN,
             {"1": frozenset({"A", "G"}), "2": frozenset({"A", "S"})},
         )
 
     def test_result_contract(self) -> None:
-        # 운임 확인부터 좌석 배정 검증까지 사용하는 응답 필드 고정
+        """운임부터 좌석 배정까지 필요한 응답 필드 확인"""
         contracts = {
             korail.PriceFareQuoteResponse: {"fares"},
             korail.PriceFare: {
@@ -88,7 +88,7 @@ class ContractTest(unittest.TestCase):
             korail.ReservationHoldResponse: {
                 "pnr_no",
                 "received_amount",
-                "payment_deadline_data",
+                "payment_deadline_date",
                 "payment_deadline_time",
                 "journeys",
             },
@@ -104,7 +104,7 @@ class ContractTest(unittest.TestCase):
                 "train_no",
                 "seats",
             },
-            korail.ResercationSeatDetail: {
+            korail.ReservationSeatDetail: {
                 "car_no",
                 "seat_no",
                 "room_class_name",
