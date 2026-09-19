@@ -8,12 +8,19 @@ from dataclasses import replace
 from datetime import date, datetime, time, timezone
 from pathlib import Path
 
-from .domain import AttemptStatus, Candidate, PurchaseAttempt, Trip, TripStatus
+from .domain import (
+    AttemptStatus,
+    Candidate,
+    PurchaseAttempt,
+    Reservation,
+    Trip,
+    TripStatus,
+)
 
 
 class TripStore:
     def __init__(self, path: str | Path) -> None:
-        """SQLite 파일에 trips, purchase_attempts 데이블 및 단일 활성 claim 인덱스 생성"""
+        """SQLite 파일에 여행·구매 테이블과 단일 활성 claim 인덱스 생성"""
         self.path = str(path)
         with self._connect() as connection:
             connection.executescript("""
@@ -38,12 +45,21 @@ class TripStore:
                     created_at TEXT NOT NULL,
                     reserve_attempted_at TEXT,
                     payment_attempted_at TEXT,
+                    reservation_json TEXT,
                     UNIQUE (trip_id, candidate_key)
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS one_active_attempt_per_trip
                 ON purchase_attempts(trip_id)
                 WHERE status NOT IN ('TICKETED', 'FAILED');
                 """)
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(purchase_attempts)")
+            }
+            if "reservation_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE purchase_attempts ADD COLUMN reservation_json TEXT"
+                )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -117,7 +133,7 @@ class TripStore:
             row = connection.execute(
                 """
                 SELECT id, trip_id, candidate_key, status, created_at,
-                       reserve_attempted_at, payment_attempted_at
+                        reserve_attempted_at, payment_attempted_at, reservation_json
                 FROM purchase_attempts WHERE id = ?
                 """,
                 (attempt_id,),
@@ -136,6 +152,7 @@ class TripStore:
             payment_attempted_at=(
                 datetime.fromisoformat(row[6]) if row[6] is not None else None
             ),
+            reservation=_reservation_from_json(row[7]),
         )
 
     def get_active_attempt(self, trip_id: int) -> PurchaseAttempt | None:
@@ -226,7 +243,9 @@ class TripStore:
             "reserve_attempted_at",
         )
 
-    def mark_reserved(self, attempt_id: int) -> PurchaseAttempt | None:
+    def mark_reserved(
+        self, attempt_id: int, reservation: Reservation
+    ) -> PurchaseAttempt | None:
         """예약 성공을 기록하고 여행과 구매 시도를 RESERVED로 전환"""
         return self._transition_attempt(
             attempt_id,
@@ -234,6 +253,7 @@ class TripStore:
             AttemptStatus.RESERVED,
             TripStatus.CLAIMING,
             TripStatus.RESERVED,
+            reservation=reservation,
         )
 
     def retry_after_reservation_failure(
@@ -269,6 +289,16 @@ class TripStore:
             TripStatus.RECONCILING,
         )
 
+    def fail_payment(self, attempt_id: int) -> PurchaseAttempt | None:
+        """확정된 결제 실패를 기록하고 여행과 구매 시도를 FAILED로 전환"""
+        return self._transition_attempt(
+            attempt_id,
+            AttemptStatus.PAYING,
+            AttemptStatus.FAILED,
+            TripStatus.PAYING,
+            TripStatus.FAILED,
+        )
+
     def mark_ticketed(self, attempt_id: int) -> PurchaseAttempt | None:
         """승차권 확인이 끝난 여행과 구매 시도를 TICKETED로 전환"""
         return self._transition_attempt(
@@ -287,20 +317,32 @@ class TripStore:
         from_trip: TripStatus,
         to_trip: TripStatus,
         timestamp_column: str | None = None,
+        reservation: Reservation | None = None,
     ) -> PurchaseAttempt | None:
-        """구매 시도와 여행 상태를 한 transaction에서 조건부 전환"""
-        if timestamp_column not in {None, "reserve_attempted_at", "payment_attempted_at"}:
+        """구매 시도와 여행 상태를 transaction에서 조건부 전환"""
+        if timestamp_column not in {
+            None,
+            "reserve_attempted_at",
+            "payment_attempted_at",
+        }:
             raise ValueError("invalid attempt timestamp column")
+        if (to_attempt is AttemptStatus.RESERVED) != (reservation is not None):
+            raise ValueError("reserved transition requires reservation data")
         required = {
             AttemptStatus.RESERVING: "AND a.reserve_attempted_at IS NOT NULL",
-            AttemptStatus.RESERVED: "AND a.reserve_attempted_at IS NOT NULL",
+            AttemptStatus.RESERVED: (
+                "AND a.reserve_attempted_at IS NOT NULL "
+                "AND a.reservation_json IS NOT NULL"
+            ),
             AttemptStatus.PAYING: (
                 "AND a.reserve_attempted_at IS NOT NULL "
-                "AND a.payment_attempted_at IS NOT NULL"
+                "AND a.payment_attempted_at IS NOT NULL "
+                "AND a.reservation_json IS NOT NULL"
             ),
             AttemptStatus.RECONCILING: (
                 "AND a.reserve_attempted_at IS NOT NULL "
-                "AND a.payment_attempted_at IS NOT NULL"
+                "AND a.payment_attempted_at IS NOT NULL "
+                "AND a.reservation_json IS NOT NULL"
             ),
         }.get(from_attempt, "")
         empty_timestamp = (
@@ -321,17 +363,17 @@ class TripStore:
             ).fetchone()
             if row is None:
                 return None
-            timestamp_assignment = (
-                f", {timestamp_column} = ?" if timestamp_column is not None else ""
-            )
-            attempt_values = (
-                (to_attempt.value, now, attempt_id)
-                if timestamp_column is not None
-                else (to_attempt.value, attempt_id)
-            )
+            assignments = ["status = ?"]
+            attempt_values: list[object] = [to_attempt.value]
+            if timestamp_column is not None:
+                assignments.append(f"{timestamp_column} = ?")
+                attempt_values.append(now)
+            if reservation is not None:
+                assignments.append("reservation_json = ?")
+                attempt_values.append(_reservation_json(reservation))
+            attempt_values.append(attempt_id)
             attempt_update = connection.execute(
-                f"UPDATE purchase_attempts SET status = ?{timestamp_assignment} "
-                "WHERE id = ?",
+                f"UPDATE purchase_attempts SET {', '.join(assignments)} WHERE id = ?",
                 attempt_values,
             )
             trip_update = connection.execute(
@@ -341,3 +383,23 @@ class TripStore:
             if attempt_update.rowcount != 1 or trip_update.rowcount != 1:
                 raise RuntimeError("purchase transition was not atomic")
         return self.get_attempt(attempt_id)
+
+
+def _reservation_json(reservation: Reservation) -> str:
+    """내부 예약 복구값을 SQLite 저장용 JSON으로 직렬화"""
+    return json.dumps(
+        {
+            "reference": reservation.reference,
+            "amount": reservation.amount,
+            "window_no": reservation.window_no,
+            "job_sequence_1": reservation.job_sequence_1,
+            "job_sequence_2": reservation.job_sequence_2,
+            "change_no": reservation.change_no,
+        },
+        separators=(",", ":"),
+    )
+
+
+def _reservation_from_json(value: str | None) -> Reservation | None:
+    """SQLite JSON을 결제 재개용 내부 예약으로 복원"""
+    return Reservation(**json.loads(value)) if value is not None else None

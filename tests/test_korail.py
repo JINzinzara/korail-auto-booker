@@ -1,26 +1,38 @@
 """KORAIL 조회 질의와 내부 후보 변환을 offline으로 확인"""
 
 import sys
+import tempfile
 import unittest
 from dataclasses import replace
 from datetime import date, datetime, time
+from pathlib import Path
 from unittest.mock import Mock
 
 import korail_mobile_api as korail
 
-from korail_booker.domain import SeatOption, Trip
+from korail_booker.domain import (
+    AttemptStatus,
+    PaymentOutcomeUnknownError,
+    Reservation,
+    SeatOption,
+    Trip,
+    TripStatus,
+)
 from korail_booker.korail import (
     candidates_result,
     create_client,
+    create_live_worker,
     login_client,
     pay_reservation_live,
     preview_reservation,
     reserve_and_cancel_live,
-    ticket_is_issued,
+    reserve_live,
     search_candidates,
     search_query,
+    ticket_is_issued,
     train_candidate,
 )
+from korail_booker.storage import TripStore
 
 
 def show_flow(title: str, *lines: str) -> None:
@@ -63,7 +75,23 @@ def make_train(**changes: object) -> korail.TrainSummary:
 def make_hold() -> korail.ReservationHoldResponse:
     """결제 테스트에 사용할 식별값 비공개 미결제 예약 생성"""
     return korail.ReservationHoldResponse(
-        pnr_no="hidden", received_amount="118000"
+        str_result="SUCC",
+        pnr_no="hidden",
+        window_no="001",
+        temporary_job_sequence_1="1",
+        received_amount="118000",
+        journeys=(korail.ReservationJourney(reservation_change_no="0"),),
+    )
+
+
+def make_reservation() -> Reservation:
+    """결제와 발권 조회 테스트에 사용할 내부 예약 생성"""
+    return Reservation(
+        reference="hidden",
+        amount=118_000,
+        window_no="001",
+        job_sequence_1="1",
+        change_no="0",
     )
 
 
@@ -338,12 +366,43 @@ class KorailGatewayTest(unittest.TestCase):
         )
         client.cancel_unpaid_hold.assert_called_once()
 
+    def test_live_reservation_returns_restart_safe_record(self) -> None:
+        """실예약 응답을 외부 모델 없는 재시작 복구값으로 변환하는지 확인"""
+        trip = make_trip()
+        train = make_train()
+        client = Mock(spec=korail.KorailClient)
+        client.search_trains.return_value = korail.TrainSearchResult(
+            trains=[train], response=korail.BaseKorailResponse()
+        )
+        client.reserve.return_value = make_hold()
+        client.get_ticket_reservation_detail.return_value = (
+            korail.TicketReservationDetailResponse(total_received_amount="118000")
+        )
+
+        reservation = reserve_live(
+            client,
+            trip,
+            train_candidate(train),
+            korail.KorailPassengerCounts(adult=2),
+            120_000,
+            approved=True,
+        )
+
+        show_flow(
+            "실예약 복구값 변환",
+            "입력: KTX 예약 응답과 확정 운임 118,000원",
+            "출력: worker·SQLite용 내부 예약 생성",
+            "예약번호 출력: 없음",
+        )
+        self.assertEqual(reservation, make_reservation())
+        client.cancel_unpaid_hold.assert_not_called()
+
     def test_live_payment_requires_explicit_charge_approval(self) -> None:
         """실카드 결제 승인이 없으면 조회와 결제를 모두 차단하는지 확인"""
         client = Mock(spec=korail.KorailClient)
 
         with self.assertRaisesRegex(PermissionError, "explicit approval"):
-            pay_reservation_live(client, make_hold(), make_card(), 120_000)
+            pay_reservation_live(client, make_reservation(), make_card(), 120_000)
 
         show_flow(
             "실결제 승인 차단",
@@ -355,7 +414,7 @@ class KorailGatewayTest(unittest.TestCase):
 
     def test_live_payment_rechecks_fare_and_verifies_ticket(self) -> None:
         """결제 직전 운임을 재검증하고 발권을 별도 조회하는지 확인"""
-        hold = make_hold()
+        reservation = make_reservation()
         card = make_card()
         payment = korail.ReservationPaymentResponse(str_result="SUCC")
         client = Mock(spec=korail.KorailClient)
@@ -369,22 +428,22 @@ class KorailGatewayTest(unittest.TestCase):
 
         result = pay_reservation_live(
             client,
-            hold,
+            reservation,
             card,
             120_000,
             real_charge_approved=True,
         )
-        issued = ticket_is_issued(client, hold.pnr_no)
+        issued = ticket_is_issued(client, reservation)
 
         show_flow(
             "실결제 및 발권 확인",
             "입력: 확정 118,000원, 승인 상한 120,000원, 일회성 실결제 승인",
             "호출: 상세 운임 재조회 → 실결제 1회 → 승차권 목록 조회",
-            f"출력: 결제={result.str_result}, 발권={issued}",
+            f"출력: 결제={result}, 발권={issued}",
             "카드정보·예약번호 출력: 없음",
         )
         client.pay_with_card.assert_called_once_with(
-            hold,
+            make_hold(),
             card,
             consent=korail.MutationConsent(
                 allow_payment=True,
@@ -393,11 +452,12 @@ class KorailGatewayTest(unittest.TestCase):
                 real_card_acknowledged=True,
             ),
         )
+        self.assertTrue(result)
         self.assertTrue(issued)
 
     def test_declined_payment_cancels_unpaid_reservation(self) -> None:
         """결제 거절 응답이면 미결제 상태를 확인해 예약을 취소하는지 확인"""
-        hold = make_hold()
+        reservation = make_reservation()
         client = Mock(spec=korail.KorailClient)
         client.get_ticket_reservation_detail.return_value = (
             korail.TicketReservationDetailResponse(total_received_amount="118000")
@@ -409,36 +469,36 @@ class KorailGatewayTest(unittest.TestCase):
             str_result="SUCC"
         )
 
-        with self.assertRaisesRegex(RuntimeError, "declined"):
-            pay_reservation_live(
-                client,
-                hold,
-                make_card(),
-                120_000,
-                real_charge_approved=True,
-            )
+        result = pay_reservation_live(
+            client,
+            reservation,
+            make_card(),
+            120_000,
+            real_charge_approved=True,
+        )
 
         show_flow(
             "결제 거절 복구",
             "입력: 서버 결제 결과=FAIL",
-            "출력: 결제 실패 명시",
+            f"출력: 결제={result}",
             "복구: 미결제 예약 취소 확인",
         )
+        self.assertFalse(result)
         client.cancel_unpaid_hold.assert_called_once()
 
     def test_unknown_payment_outcome_is_not_retried_or_cancelled(self) -> None:
         """결제 응답이 불명확하면 재결제나 취소 없이 조회 복구로 넘기는지 확인"""
-        hold = make_hold()
+        reservation = make_reservation()
         client = Mock(spec=korail.KorailClient)
         client.get_ticket_reservation_detail.return_value = (
             korail.TicketReservationDetailResponse(total_received_amount="118000")
         )
         client.pay_with_card.side_effect = TimeoutError("response unavailable")
 
-        with self.assertRaisesRegex(RuntimeError, "outcome is unknown"):
+        with self.assertRaisesRegex(PaymentOutcomeUnknownError, "outcome is unknown"):
             pay_reservation_live(
                 client,
-                hold,
+                reservation,
                 make_card(),
                 120_000,
                 real_charge_approved=True,
@@ -452,6 +512,55 @@ class KorailGatewayTest(unittest.TestCase):
         )
         self.assertEqual(client.pay_with_card.call_count, 1)
         client.cancel_unpaid_hold.assert_not_called()
+
+    def test_live_gateway_connects_to_worker_end_to_end(self) -> None:
+        """조회부터 발권 확인까지 실제 gateway 계약이 worker에 연결되는지 확인"""
+        with tempfile.TemporaryDirectory() as directory:
+            store = TripStore(Path(directory) / "booker.sqlite3")
+            trip = store.create_trip(make_trip())
+            store.start_trip(trip.id)
+            train = make_train()
+            client = Mock(spec=korail.KorailClient)
+            client.search_trains.return_value = korail.TrainSearchResult(
+                trains=[train], response=korail.BaseKorailResponse()
+            )
+            client.reserve.return_value = make_hold()
+            client.get_ticket_reservation_detail.return_value = (
+                korail.TicketReservationDetailResponse(
+                    total_received_amount="118000"
+                )
+            )
+            client.pay_with_card.return_value = korail.ReservationPaymentResponse(
+                str_result="SUCC"
+            )
+            client.get_ticket_list.return_value = korail.BaseKorailResponse(
+                raw={"tickets": [{"h_pnr_no": "hidden"}]}
+            )
+            worker = create_live_worker(
+                store,
+                client,
+                korail.KorailPassengerCounts(adult=2),
+                make_card(),
+                120_000,
+                reserve_approved=True,
+                real_charge_approved=True,
+            )
+
+            result = worker.run_once(trip.id)
+
+            show_flow(
+                "라이브 gateway → worker 통합",
+                "입력: 서울→부산, 성인 2명, 상한 120,000원, 예약·결제 승인",
+                "흐름: 조회 → 재조회·예약 → SQLite 저장 → 결제 → 승차권 확인",
+                f"출력 구매/여행 상태: {result.status} / {store.get_trip(trip.id).status}",
+                "카드정보·예약번호 출력: 없음",
+            )
+            self.assertEqual(result.status, AttemptStatus.TICKETED)
+            self.assertEqual(store.get_trip(trip.id).status, TripStatus.TICKETED)
+            self.assertEqual(client.search_trains.call_count, 2)
+            client.reserve.assert_called_once()
+            client.pay_with_card.assert_called_once()
+            client.get_ticket_list.assert_called_once()
 
 
 if __name__ == "__main__":

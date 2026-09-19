@@ -7,7 +7,15 @@ from datetime import date, datetime, time
 from pathlib import Path
 from unittest.mock import Mock
 
-from korail_booker.domain import AttemptStatus, Candidate, SeatOption, Trip, TripStatus
+from korail_booker.domain import (
+    AttemptStatus,
+    Candidate,
+    PaymentOutcomeUnknownError,
+    Reservation,
+    SeatOption,
+    Trip,
+    TripStatus,
+)
 from korail_booker.storage import TripStore
 from korail_booker.worker import BookingWorker
 
@@ -46,6 +54,11 @@ def make_candidate(train_no: str = "005") -> Candidate:
     )
 
 
+def make_reservation() -> Reservation:
+    """worker 상태 저장과 결제 테스트에 사용할 내부 예약 생성"""
+    return Reservation(reference="hidden", amount=59_800, window_no="001")
+
+
 def start_trip(store: TripStore) -> Trip:
     """저장 후 MONITORING 상태가 된 여행 반환"""
     trip = store.create_trip(make_trip())
@@ -62,8 +75,8 @@ class BookingWorkerTest(unittest.TestCase):
             store = TripStore(Path(directory) / "booker.sqlite3")
             trip = start_trip(store)
             search = Mock(return_value=(make_candidate(),))
-            reserve = Mock(return_value=True)
-            pay = Mock(return_value=None)
+            reserve = Mock(return_value=make_reservation())
+            pay = Mock(return_value=True)
             verify = Mock(return_value=True)
             result = BookingWorker(store, search, reserve, pay, verify).run_once(trip.id)
 
@@ -76,7 +89,7 @@ class BookingWorkerTest(unittest.TestCase):
             )
 
             search.assert_called_once_with(trip)
-            reserve.assert_called_once_with(make_candidate())
+            reserve.assert_called_once_with(trip, make_candidate())
             pay.assert_called_once()
             verify.assert_called_once()
             self.assertEqual(result.status, AttemptStatus.TICKETED)
@@ -90,7 +103,7 @@ class BookingWorkerTest(unittest.TestCase):
             worker = BookingWorker(
                 store,
                 Mock(return_value=(make_candidate(),)),
-                Mock(return_value=False),
+                Mock(return_value=None),
                 Mock(),
                 Mock(),
             )
@@ -98,7 +111,7 @@ class BookingWorkerTest(unittest.TestCase):
 
             show_flow(
                 "예약 실패 재시도",
-                "입력: KTX 005 후보의 예약 결과=False",
+                "입력: KTX 005 후보의 예약 결과=None",
                 f"출력 구매 상태: {result.status}",
                 f"출력 여행 상태: {store.get_trip(trip.id).status}",
             )
@@ -106,21 +119,47 @@ class BookingWorkerTest(unittest.TestCase):
             self.assertEqual(result.status, AttemptStatus.FAILED)
             self.assertEqual(store.get_trip(trip.id).status, TripStatus.MONITORING)
 
+    def test_declined_payment_marks_trip_failed(self) -> None:
+        """확정된 결제 거절은 재시도하지 않고 여행을 FAILED로 끝내는지 확인"""
+        with tempfile.TemporaryDirectory() as directory:
+            store = TripStore(Path(directory) / "booker.sqlite3")
+            trip = start_trip(store)
+            pay = Mock(return_value=False)
+            result = BookingWorker(
+                store,
+                Mock(return_value=(make_candidate(),)),
+                Mock(return_value=make_reservation()),
+                pay,
+                Mock(),
+            ).run_once(trip.id)
+
+            show_flow(
+                "결제 거절 종료",
+                "입력: 결제 결과=False, 미결제 예약 취소 완료",
+                f"출력 구매/여행 상태: {result.status} / {store.get_trip(trip.id).status}",
+                "재결제 횟수: 0",
+            )
+            self.assertEqual(result.status, AttemptStatus.FAILED)
+            self.assertEqual(store.get_trip(trip.id).status, TripStatus.FAILED)
+            pay.assert_called_once()
+
     def test_payment_error_stays_reconciling(self) -> None:
         """결제 예외가 재결제 대신 RECONCILING으로 남는지 확인"""
         with tempfile.TemporaryDirectory() as directory:
             store = TripStore(Path(directory) / "booker.sqlite3")
             trip = start_trip(store)
-            pay = Mock(side_effect=TimeoutError("payment result unknown"))
+            pay = Mock(
+                side_effect=PaymentOutcomeUnknownError("payment result unknown")
+            )
             worker = BookingWorker(
                 store,
                 Mock(return_value=(make_candidate(),)),
-                Mock(return_value=True),
+                Mock(return_value=make_reservation()),
                 pay,
                 Mock(return_value=False),
             )
 
-            with self.assertRaises(TimeoutError):
+            with self.assertRaises(PaymentOutcomeUnknownError):
                 worker.run_once(trip.id)
             attempt_id = pay.call_args.args[0].id
             attempt = store.get_attempt(attempt_id)
@@ -145,8 +184,8 @@ class BookingWorkerTest(unittest.TestCase):
             worker = BookingWorker(
                 store,
                 Mock(return_value=(make_candidate(),)),
+                Mock(return_value=make_reservation()),
                 Mock(return_value=True),
-                Mock(return_value=None),
                 verify,
             )
             first = worker.run_once(trip.id)
@@ -174,8 +213,8 @@ class BookingWorkerTest(unittest.TestCase):
             result = BookingWorker(
                 store,
                 search,
+                Mock(return_value=make_reservation()),
                 Mock(return_value=True),
-                Mock(return_value=None),
                 Mock(return_value=True),
             ).poll(trip.id, max_polls=2, sleep=sleep)
 
@@ -194,12 +233,14 @@ class BookingWorkerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = TripStore(Path(directory) / "booker.sqlite3")
             trip = start_trip(store)
-            pay = Mock(side_effect=TimeoutError("payment result unknown"))
+            pay = Mock(
+                side_effect=PaymentOutcomeUnknownError("payment result unknown")
+            )
             verify = Mock(return_value=True)
             result = BookingWorker(
                 store,
                 Mock(return_value=(make_candidate(),)),
-                Mock(return_value=True),
+                Mock(return_value=make_reservation()),
                 pay,
                 verify,
             ).poll(trip.id, max_polls=2, sleep=Mock())
@@ -242,12 +283,12 @@ class BookingWorkerTest(unittest.TestCase):
             trip = start_trip(store)
             first = make_candidate("005")
             second = make_candidate("007")
-            reserve = Mock(side_effect=(False, True))
+            reserve = Mock(side_effect=(None, make_reservation()))
             worker = BookingWorker(
                 store,
                 Mock(return_value=(first, second)),
                 reserve,
-                Mock(return_value=None),
+                Mock(return_value=True),
                 Mock(return_value=True),
             )
             result = worker.poll(trip.id, max_polls=2, sleep=Mock())
@@ -261,6 +302,57 @@ class BookingWorkerTest(unittest.TestCase):
             self.assertTrue(result.candidate_key.startswith("007:"))
             self.assertEqual(result.status, AttemptStatus.TICKETED)
             self.assertEqual(reserve.call_count, 2)
+
+    def test_restart_from_reserved_continues_payment(self) -> None:
+        """예약 저장 뒤 재시작하면 예약을 반복하지 않고 결제부터 재개하는지 확인"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "booker.sqlite3"
+            store = TripStore(path)
+            trip = start_trip(store)
+            claimed = store.claim_candidate(trip.id, make_candidate())
+            store.start_reservation(claimed.id)
+            store.mark_reserved(claimed.id, make_reservation())
+
+            pay = Mock(return_value=True)
+            verify = Mock(return_value=True)
+            worker = BookingWorker(TripStore(path), Mock(), Mock(), pay, verify)
+            result = worker.poll(trip.id, max_polls=1)
+
+            show_flow(
+                "RESERVED 재시작 복구",
+                "저장 상태: 예약 식별값·운임 보존, 결제 미시도",
+                "복구 흐름: 예약 반복 없이 결제 → 승차권 확인",
+                f"출력: {result.status}, 결제 호출={pay.call_count}회",
+            )
+            self.assertEqual(result.status, AttemptStatus.TICKETED)
+            self.assertEqual(pay.call_count, 1)
+            self.assertEqual(verify.call_count, 1)
+
+    def test_restart_from_paying_reconciles_without_repayment(self) -> None:
+        """결제 시작 뒤 재시작하면 재결제 없이 승차권만 확인하는지 확인"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "booker.sqlite3"
+            store = TripStore(path)
+            trip = start_trip(store)
+            claimed = store.claim_candidate(trip.id, make_candidate())
+            store.start_reservation(claimed.id)
+            store.mark_reserved(claimed.id, make_reservation())
+            store.start_payment(claimed.id)
+
+            pay = Mock()
+            verify = Mock(return_value=True)
+            worker = BookingWorker(TripStore(path), Mock(), Mock(), pay, verify)
+            result = worker.poll(trip.id, max_polls=1)
+
+            show_flow(
+                "PAYING 재시작 복구",
+                "저장 상태: 결제 호출 시각 있음, 결과 불명확",
+                "복구 흐름: 재결제 없이 승차권 조회만 실행",
+                f"출력: {result.status}, 결제 호출={pay.call_count}회",
+            )
+            self.assertEqual(result.status, AttemptStatus.TICKETED)
+            pay.assert_not_called()
+            verify.assert_called_once()
 
     def test_poll_does_not_retry_search_error(self) -> None:
         """KORAIL 조회 오류를 반복 호출하지 않고 즉시 전달하는지 확인"""

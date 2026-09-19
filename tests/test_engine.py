@@ -6,7 +6,14 @@ import unittest
 from datetime import date, datetime, time
 from pathlib import Path
 
-from korail_booker.domain import AttemptStatus, Candidate, SeatOption, Trip, TripStatus
+from korail_booker.domain import (
+    AttemptStatus,
+    Candidate,
+    Reservation,
+    SeatOption,
+    Trip,
+    TripStatus,
+)
 from korail_booker.engine import pick_candidate
 from korail_booker.storage import TripStore
 
@@ -50,6 +57,16 @@ def make_candidate(
         departure_at=datetime(2026, 10, 1, hour),
         arrival_at=datetime(2026, 10, 1, hour + 3),
         seat_option=seat_option,
+    )
+
+
+def make_reservation() -> Reservation:
+    """재시작 복구 테스트에 사용할 내부 예약 생성"""
+    return Reservation(
+        reference="hidden",
+        amount=59_800,
+        window_no="001",
+        job_sequence_1="1",
     )
 
 
@@ -114,7 +131,8 @@ class Phase1Test(unittest.TestCase):
     def test_purchase_state_flow(self) -> None:
         """예약·결제 호출을 한 번만 허용하고 순서대로 상태를 전환하는지 확인"""
         with tempfile.TemporaryDirectory() as directory:
-            store = TripStore(Path(directory) / "booker.sqlite3")
+            path = Path(directory) / "booker.sqlite3"
+            store = TripStore(path)
             trip = store.create_trip(make_trip())
             store.start_trip(trip.id)
             claimed = store.claim_candidate(trip.id, make_candidate("001", 9))
@@ -122,7 +140,10 @@ class Phase1Test(unittest.TestCase):
             early_payment = store.start_payment(claimed.id)
             reserving = store.start_reservation(claimed.id)
             duplicate_reservation = store.start_reservation(claimed.id)
-            reserved = store.mark_reserved(claimed.id)
+            reservation = make_reservation()
+            reserved = store.mark_reserved(claimed.id, reservation)
+            store = TripStore(path)
+            restored = store.get_attempt(claimed.id)
             paying = store.start_payment(claimed.id)
             duplicate_payment = store.start_payment(claimed.id)
             reconciling = store.mark_reconciling(claimed.id)
@@ -135,6 +156,7 @@ class Phase1Test(unittest.TestCase):
                 f"예약 시작: {reserving.status}, at={reserving.reserve_attempted_at}",
                 f"중복 예약 시작: {duplicate_reservation}",
                 f"예약 완료: {reserved.status}",
+                "재시작 후 예약 복구: 식별값·운임 저장 확인",
                 f"결제 시작: {paying.status}, at={paying.payment_attempted_at}",
                 f"중복 결제 시작: {duplicate_payment}",
                 f"승차권 확인 대기: {reconciling.status}",
@@ -147,6 +169,7 @@ class Phase1Test(unittest.TestCase):
             self.assertEqual(reserving.status, AttemptStatus.RESERVING)
             self.assertIsNotNone(reserving.reserve_attempted_at)
             self.assertEqual(reserved.status, AttemptStatus.RESERVED)
+            self.assertEqual(restored.reservation, reservation)
             self.assertEqual(paying.status, AttemptStatus.PAYING)
             self.assertIsNotNone(paying.payment_attempted_at)
             self.assertEqual(reconciling.status, AttemptStatus.RECONCILING)
