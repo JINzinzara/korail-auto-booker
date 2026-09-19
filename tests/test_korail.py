@@ -12,6 +12,8 @@ from korail_booker.domain import SeatOption, Trip
 from korail_booker.korail import (
     candidates_result,
     create_client,
+    login_client,
+    preview_reservation,
     search_candidates,
     search_query,
     train_candidate,
@@ -70,6 +72,23 @@ class KorailGatewayTest(unittest.TestCase):
             self.assertTrue(client.config.dynapath.enabled)
         finally:
             client.close()
+
+    def test_login_client_passes_credentials_without_storing_them(self) -> None:
+        """로그인 자격증명을 client에만 전달하는지 확인"""
+        client = Mock(spec=korail.KorailClient)
+        session = Mock(spec=korail.KorailSession)
+        client.login.return_value = session
+
+        result = login_client(client, "member", "password")
+
+        show_flow(
+            "로그인 연결",
+            "입력: 호출자가 제공한 회원 식별자와 비밀번호",
+            "호출: KorailClient.login 1회",
+            "출력: 인증 세션",
+        )
+        client.login.assert_called_once_with("member", "password")
+        self.assertIs(result, session)
 
     def test_search_query(self) -> None:
         """여행의 역, 날짜, 시작시각, 승객 수를 조회에 반영하는지 확인"""
@@ -159,6 +178,40 @@ class KorailGatewayTest(unittest.TestCase):
         )
         client.search_trains.assert_called_once_with(search_query(trip))
         self.assertEqual(candidates[0].train_no, "001")
+
+    def test_reservation_preview_revalidates_without_sending(self) -> None:
+        """최신 열차를 다시 확인하고 예약 요청을 dry-run으로만 만드는지 확인"""
+        trip = make_trip()
+        train = make_train()
+        candidate = train_candidate(train)
+        passengers = korail.KorailPassengerCounts(adult=2)
+        preview = korail.MutationPreview(
+            category="reserve",
+            method="POST",
+            route="/reservation",
+            payload={"train": "001"},
+        )
+        client = Mock(spec=korail.KorailClient)
+        client.search_trains.return_value = korail.TrainSearchResult(
+            trains=[train],
+            response=korail.BaseKorailResponse(),
+        )
+        client.reserve.return_value = preview
+
+        result = preview_reservation(client, trip, candidate, passengers)
+
+        show_flow(
+            "예약 dry-run",
+            "입력: KTX 001 FULL, 성인 2명",
+            "호출: 최신 좌석 재조회 → 예약 payload 생성",
+            f"출력: {result.category}, {result.note}",
+        )
+        client.reserve.assert_called_once_with(
+            train,
+            consent=korail.MutationConsent(allow_reserve=True),
+            passengers=passengers,
+        )
+        self.assertEqual(result.note, "dry-run: not sent")
 
 
 if __name__ == "__main__":

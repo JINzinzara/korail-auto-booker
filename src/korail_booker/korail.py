@@ -12,6 +12,13 @@ def create_client() -> korail.KorailClient:
     return korail.KorailClient(korail.KorailConfig(enable_dynapath=True))
 
 
+def login_client(
+    client: korail.KorailClient, member_no: str, password: str
+) -> korail.KorailSession:
+    """호출자가 제공한 자격증명으로 KORAIL 세션 시작"""
+    return client.login(member_no, password)
+
+
 def search_query(trip: Trip) -> korail.TrainSearchQuery:
     """내부 여행 조건을 KORAIL 열차 조회 질의로 변환"""
     return korail.TrainSearchQuery(
@@ -61,6 +68,41 @@ def search_candidates(
 ) -> tuple[Candidate, ...]:
     """KORAIL 읽기 API를 한 번 호출해 예약 가능한 내부 후보를 반환"""
     return candidates_result(client.search_trains(search_query(trip)))
+
+
+def preview_reservation(
+    client: korail.KorailClient,
+    trip: Trip,
+    candidate: Candidate,
+    passengers: korail.KorailPassengerCounts,
+) -> korail.MutationPreview:
+    """후보를 다시 확인하고 전 구간 좌석 예약 요청을 전송 없이 생성"""
+    if passengers.total != trip.passenger_count:
+        raise ValueError("passenger counts must match the trip")
+    if candidate.seat_option is not SeatOption.FULL:
+        raise ValueError("merge-seat reservation is not implemented")
+    train = _find_train(client, trip, candidate)
+    if train is None:
+        raise ValueError("candidate is no longer available")
+    preview = client.reserve(
+        train,
+        consent=korail.MutationConsent(allow_reserve=True),
+        passengers=passengers,
+    )
+    if not isinstance(preview, korail.MutationPreview):
+        raise RuntimeError("dry-run unexpectedly changed KORAIL state")
+    return preview
+
+
+def _find_train(
+    client: korail.KorailClient, trip: Trip, candidate: Candidate
+) -> korail.TrainSummary | None:
+    """최신 조회 결과에서 내부 후보와 정확히 일치하는 KORAIL 열차 반환"""
+    result = client.search_trains(search_query(trip))
+    for train in result.trains:
+        if train_candidate(train) == candidate:
+            return train
+    return None
 
 
 def _schedule_datetime(date_value: str | None, time_value: str | None) -> datetime:
