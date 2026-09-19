@@ -1,5 +1,6 @@
 """KORAIL 조회 질의와 내부 후보 변환을 offline으로 확인"""
 
+import sys
 import unittest
 from dataclasses import replace
 from datetime import date, datetime, time
@@ -8,10 +9,21 @@ import korail_mobile_api as korail
 
 from korail_booker.domain import SeatOption, Trip
 from korail_booker.korail import (
-    build_search_query,
-    candidate_from_train,
-    candidates_from_result,
+    candidates_result,
+    search_query,
+    train_candidate,
 )
+
+
+def show_flow(title: str, *lines: str) -> None:
+    """테스트의 입력과 실제 산출값을 사람이 읽기 쉽게 출력"""
+    print(
+        f"\n[{title}]",
+        *(f"  {line}" for line in lines),
+        sep="\n",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def make_trip() -> Trip:
@@ -44,8 +56,16 @@ class KorailGatewayTest(unittest.TestCase):
     """외부 조회 계약이 내부 계약으로 안전하게 변환되는지 확인"""
 
     def test_search_query(self) -> None:
-        """여행의 역, 날짜, 시작시각, 승객 수를 조회 질의에 반영하는지 확인"""
-        query = build_search_query(make_trip())
+        """여행의 역, 날짜, 시작시각, 승객 수를 조회에 반영하는지 확인"""
+        trip = make_trip()
+        query = search_query(trip)
+        show_flow(
+            "여행 → KORAIL 조회",
+            "입력: 서울 → 부산, 2026-10-01 08:30~12:00, KTX, 승객 2명",
+            f"출력: {query.departure_station_code} → {query.arrival_station_code}, "
+            f"date={query.departure_date}, time={query.departure_time}, "
+            f"passengers={query.passengers}",
+        )
         self.assertEqual(query.departure_station_code, "서울")
         self.assertEqual(query.arrival_station_code, "부산")
         self.assertEqual(query.departure_date, "20261001")
@@ -72,7 +92,17 @@ class KorailGatewayTest(unittest.TestCase):
             response=korail.BaseKorailResponse(),
         )
 
-        candidates = candidates_from_result(result)
+        candidates = candidates_result(result)
+        show_flow(
+            "KORAIL 응답 → 내부 후보",
+            "입력: 001 code=11 / 003 code=13 merge=A / 005 code=13 merge=N",
+            "판정: 001=FULL / 003=MERGE / 005=제외",
+            "출력: "
+            + ", ".join(
+                f"{candidate.train_no} {candidate.train_type} {candidate.seat_option}"
+                for candidate in candidates
+            ),
+        )
 
         self.assertEqual(
             [candidate.train_no for candidate in candidates], ["001", "003"]
@@ -82,12 +112,18 @@ class KorailGatewayTest(unittest.TestCase):
 
     def test_candidate_handles_next_day_arrival(self) -> None:
         """자정 이후 도착 열차의 도착일을 다음 날로 계산하는지 확인"""
-        candidate = candidate_from_train(
+        candidate = train_candidate(
             make_train(departure_time="235000", arrival_time="013000")
+        )
+        show_flow(
+            "자정 통과 시각 변환",
+            "입력: 20261001, 출발=235000, 도착=013000",
+            f"출력 출발: {candidate.departure_at.isoformat(sep=' ')}",
+            f"출력 도착: {candidate.arrival_at.isoformat(sep=' ')}",
         )
         self.assertEqual(candidate.departure_at, datetime(2026, 10, 1, 23, 50))
         self.assertEqual(candidate.arrival_at, datetime(2026, 10, 2, 1, 30))
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)

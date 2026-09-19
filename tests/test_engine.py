@@ -1,5 +1,6 @@
 """engine의 domain, 후보 선택, SQLite claim 흐름 확인"""
 
+import sys
 import tempfile
 import unittest
 from datetime import date, datetime, time
@@ -8,6 +9,17 @@ from pathlib import Path
 from korail_booker.domain import Candidate, SeatOption, Trip, TripStatus
 from korail_booker.engine import pick_candidate
 from korail_booker.storage import TripStore
+
+
+def show_flow(title: str, *lines: str) -> None:
+    """테스트의 입력과 실제 산출값을 사람이 읽기 쉽게 출력"""
+    print(
+        f"\n[{title}]",
+        *(f"  {line}" for line in lines),
+        sep="\n",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def make_trip(**changes: object) -> Trip:
@@ -44,40 +56,61 @@ def make_candidate(
 class Phase1Test(unittest.TestCase):
     def test_trip_validation_no_passenger_limit(self) -> None:
         """승객 수의 상한 없이 필수 여행 조건만 검증하여 확인"""
-        self.assertEqual(make_trip(passenger_count=3).passenger_count, 3)
-        with self.assertRaises(ValueError):
+        trip = make_trip(passenger_count=3)
+        with self.assertRaises(ValueError) as error:
             make_trip(arrival_station="서울")
+        show_flow(
+            "여행 조건 검증",
+            "입력: 서울 → 부산, 2026-10-01 08:00~12:00, KTX, 승객 3명",
+            f"출력: 유효한 Trip, passenger_count={trip.passenger_count}",
+            f"잘못된 입력: 서울 → 서울 → {error.exception}",
+        )
+        self.assertEqual(trip.passenger_count, 3)
 
     def test_candidate_selection(self) -> None:
         """열차 종류를 필터링하고 전 구간 좌석을 우선 여부 확인"""
         trip = make_trip(allow_merge_seat=True)
-        selected = pick_candidate(
-            trip,
-            (
-                make_candidate("001", 8, train_type="ITX"),
-                make_candidate("003", 9, seat_option=SeatOption.MERGE),
-                make_candidate("005", 10),
-            ),
+        candidates = (
+            make_candidate("001", 8, train_type="ITX"),
+            make_candidate("003", 9, seat_option=SeatOption.MERGE),
+            make_candidate("005", 10),
+        )
+        selected = pick_candidate(trip, candidates)
+        merge_denied = pick_candidate(
+            make_trip(), (make_candidate("003", 9, seat_option=SeatOption.MERGE),)
+        )
+        show_flow(
+            "후보 선택",
+            "여행 조건: KTX, 08:00~12:00, 좌석·입석 허용",
+            "입력 후보: 001 ITX 08:00 FULL / 003 KTX 09:00 MERGE / 005 KTX 10:00 FULL",
+            f"출력 후보: {selected.train_no} {selected.train_type} {selected.seat_option}",
+            f"좌석·입석 불허 시 003 결과: {merge_denied}",
         )
         self.assertEqual(selected, make_candidate("005", 10))
-        self.assertIsNone(
-            pick_candidate(
-                make_trip(), (make_candidate("003", 9, seat_option=SeatOption.MERGE),)
-            )
-        )
+        self.assertIsNone(merge_denied)
 
     def test_sqlite_allows(self) -> None:
         """SQLite가 한 여행에 하나의 활성 claim만 허용하는지 확인"""
         with tempfile.TemporaryDirectory() as directory:
             store = TripStore(Path(directory) / "booker.sqlite3")
             trip = store.create_trip(make_trip())
-            self.assertTrue(store.start_trip(trip.id))
-            self.assertIsNotNone(
-                store.claim_candidate(trip.id, make_candidate("001", 9))
+            started = store.start_trip(trip.id)
+            first_claim = store.claim_candidate(trip.id, make_candidate("001", 9))
+            second_claim = store.claim_candidate(trip.id, make_candidate("003", 10))
+            stored = store.get_trip(trip.id)
+            show_flow(
+                "SQLite 단일 claim",
+                f"여행 저장: id={trip.id}, status={trip.status}",
+                f"감시 시작: {started}",
+                f"첫 claim: id={first_claim.id}, status={first_claim.status}",
+                f"두 번째 claim: {second_claim}",
+                f"최종 여행 상태: {stored.status}",
             )
-            self.assertIsNone(store.claim_candidate(trip.id, make_candidate("003", 10)))
-            self.assertEqual(store.get_trip(trip.id).status, TripStatus.CLAIMING)
+            self.assertTrue(started)
+            self.assertIsNotNone(first_claim)
+            self.assertIsNone(second_claim)
+            self.assertEqual(stored.status, TripStatus.CLAIMING)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)
