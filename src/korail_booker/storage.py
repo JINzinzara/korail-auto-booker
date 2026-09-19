@@ -2,6 +2,8 @@
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import date, datetime, time, timezone
 from pathlib import Path
@@ -43,11 +45,16 @@ class TripStore:
                 WHERE status NOT IN ('TICKETED', 'FAILED');
                 """)
 
-    def _connect(self) -> sqlite3.Connection:
-        """외래 키 검사를 활성화한 SQLite 연결 생성"""
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """외래 키를 활성화하고 transaction 뒤 연결을 항상 종료"""
         connection = sqlite3.connect(self.path)
         connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def create_trip(self, trip: Trip) -> Trip:
         """새 DRAFT 여행을 저장, 발급된 ID를 포함해 반환"""
@@ -104,6 +111,33 @@ class TripStore:
             status=TripStatus(row[9]),
         )
 
+    def get_attempt(self, attempt_id: int) -> PurchaseAttempt | None:
+        """ID로 구매 시도를 조회하고 없으면 None"""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, trip_id, candidate_key, status, created_at,
+                       reserve_attempted_at, payment_attempted_at
+                FROM purchase_attempts WHERE id = ?
+                """,
+                (attempt_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return PurchaseAttempt(
+            id=row[0],
+            trip_id=row[1],
+            candidate_key=row[2],
+            status=AttemptStatus(row[3]),
+            created_at=datetime.fromisoformat(row[4]),
+            reserve_attempted_at=(
+                datetime.fromisoformat(row[5]) if row[5] is not None else None
+            ),
+            payment_attempted_at=(
+                datetime.fromisoformat(row[6]) if row[6] is not None else None
+            ),
+        )
+
     def start_trip(self, trip_id: int) -> bool:
         """DRAFT 여행을 MONITORING으로 한 번만 전환"""
         with self._connect() as connection:
@@ -145,3 +179,118 @@ class TripStore:
             candidate_key=candidate.key,
             created_at=now,
         )
+
+    def start_reservation(self, attempt_id: int) -> PurchaseAttempt | None:
+        """CLAIMED 구매 시도의 예약 호출을 한 번만 시작"""
+        return self._transition_attempt(
+            attempt_id,
+            AttemptStatus.CLAIMED,
+            AttemptStatus.RESERVING,
+            TripStatus.CLAIMING,
+            TripStatus.CLAIMING,
+            "reserve_attempted_at",
+        )
+
+    def mark_reserved(self, attempt_id: int) -> PurchaseAttempt | None:
+        """예약 성공을 기록하고 여행과 구매 시도를 RESERVED로 전환"""
+        return self._transition_attempt(
+            attempt_id,
+            AttemptStatus.RESERVING,
+            AttemptStatus.RESERVED,
+            TripStatus.CLAIMING,
+            TripStatus.RESERVED,
+        )
+
+    def start_payment(self, attempt_id: int) -> PurchaseAttempt | None:
+        """RESERVED 구매 시도의 결제 호출을 한 번만 시작"""
+        return self._transition_attempt(
+            attempt_id,
+            AttemptStatus.RESERVED,
+            AttemptStatus.PAYING,
+            TripStatus.RESERVED,
+            TripStatus.PAYING,
+            "payment_attempted_at",
+        )
+
+    def mark_reconciling(self, attempt_id: int) -> PurchaseAttempt | None:
+        """결제 호출 후 승차권 확인이 필요한 상태로 전환"""
+        return self._transition_attempt(
+            attempt_id,
+            AttemptStatus.PAYING,
+            AttemptStatus.RECONCILING,
+            TripStatus.PAYING,
+            TripStatus.RECONCILING,
+        )
+
+    def mark_ticketed(self, attempt_id: int) -> PurchaseAttempt | None:
+        """승차권 확인이 끝난 여행과 구매 시도를 TICKETED로 전환"""
+        return self._transition_attempt(
+            attempt_id,
+            AttemptStatus.RECONCILING,
+            AttemptStatus.TICKETED,
+            TripStatus.RECONCILING,
+            TripStatus.TICKETED,
+        )
+
+    def _transition_attempt(
+        self,
+        attempt_id: int,
+        from_attempt: AttemptStatus,
+        to_attempt: AttemptStatus,
+        from_trip: TripStatus,
+        to_trip: TripStatus,
+        timestamp_column: str | None = None,
+    ) -> PurchaseAttempt | None:
+        """구매 시도와 여행 상태를 한 transaction에서 조건부 전환"""
+        if timestamp_column not in {None, "reserve_attempted_at", "payment_attempted_at"}:
+            raise ValueError("invalid attempt timestamp column")
+        required = {
+            AttemptStatus.RESERVING: "AND a.reserve_attempted_at IS NOT NULL",
+            AttemptStatus.RESERVED: "AND a.reserve_attempted_at IS NOT NULL",
+            AttemptStatus.PAYING: (
+                "AND a.reserve_attempted_at IS NOT NULL "
+                "AND a.payment_attempted_at IS NOT NULL"
+            ),
+            AttemptStatus.RECONCILING: (
+                "AND a.reserve_attempted_at IS NOT NULL "
+                "AND a.payment_attempted_at IS NOT NULL"
+            ),
+        }.get(from_attempt, "")
+        empty_timestamp = (
+            f"AND a.{timestamp_column} IS NULL" if timestamp_column is not None else ""
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                f"""
+                SELECT a.trip_id
+                FROM purchase_attempts AS a
+                JOIN trips AS t ON t.id = a.trip_id
+                WHERE a.id = ? AND a.status = ? AND t.status = ?
+                {required} {empty_timestamp}
+                """,
+                (attempt_id, from_attempt.value, from_trip.value),
+            ).fetchone()
+            if row is None:
+                return None
+            timestamp_assignment = (
+                f", {timestamp_column} = ?" if timestamp_column is not None else ""
+            )
+            attempt_values = (
+                (to_attempt.value, now, attempt_id)
+                if timestamp_column is not None
+                else (to_attempt.value, attempt_id)
+            )
+            attempt_update = connection.execute(
+                f"UPDATE purchase_attempts SET status = ?{timestamp_assignment} "
+                "WHERE id = ?",
+                attempt_values,
+            )
+            trip_update = connection.execute(
+                "UPDATE trips SET status = ? WHERE id = ?",
+                (to_trip.value, row[0]),
+            )
+            if attempt_update.rowcount != 1 or trip_update.rowcount != 1:
+                raise RuntimeError("purchase transition was not atomic")
+        return self.get_attempt(attempt_id)

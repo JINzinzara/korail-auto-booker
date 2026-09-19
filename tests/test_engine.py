@@ -6,7 +6,7 @@ import unittest
 from datetime import date, datetime, time
 from pathlib import Path
 
-from korail_booker.domain import Candidate, SeatOption, Trip, TripStatus
+from korail_booker.domain import AttemptStatus, Candidate, SeatOption, Trip, TripStatus
 from korail_booker.engine import pick_candidate
 from korail_booker.storage import TripStore
 
@@ -110,6 +110,48 @@ class Phase1Test(unittest.TestCase):
             self.assertIsNotNone(first_claim)
             self.assertIsNone(second_claim)
             self.assertEqual(stored.status, TripStatus.CLAIMING)
+
+    def test_purchase_state_flow(self) -> None:
+        """예약·결제 호출을 한 번만 허용하고 순서대로 상태를 전환하는지 확인"""
+        with tempfile.TemporaryDirectory() as directory:
+            store = TripStore(Path(directory) / "booker.sqlite3")
+            trip = store.create_trip(make_trip())
+            store.start_trip(trip.id)
+            claimed = store.claim_candidate(trip.id, make_candidate("001", 9))
+
+            early_payment = store.start_payment(claimed.id)
+            reserving = store.start_reservation(claimed.id)
+            duplicate_reservation = store.start_reservation(claimed.id)
+            reserved = store.mark_reserved(claimed.id)
+            paying = store.start_payment(claimed.id)
+            duplicate_payment = store.start_payment(claimed.id)
+            reconciling = store.mark_reconciling(claimed.id)
+            ticketed = store.mark_ticketed(claimed.id)
+            final_trip = store.get_trip(trip.id)
+
+            show_flow(
+                "구매 상태 전이",
+                f"CLAIMED에서 조기 결제: {early_payment}",
+                f"예약 시작: {reserving.status}, at={reserving.reserve_attempted_at}",
+                f"중복 예약 시작: {duplicate_reservation}",
+                f"예약 완료: {reserved.status}",
+                f"결제 시작: {paying.status}, at={paying.payment_attempted_at}",
+                f"중복 결제 시작: {duplicate_payment}",
+                f"승차권 확인 대기: {reconciling.status}",
+                f"최종 구매/여행: {ticketed.status} / {final_trip.status}",
+            )
+
+            self.assertIsNone(early_payment)
+            self.assertIsNone(duplicate_reservation)
+            self.assertIsNone(duplicate_payment)
+            self.assertEqual(reserving.status, AttemptStatus.RESERVING)
+            self.assertIsNotNone(reserving.reserve_attempted_at)
+            self.assertEqual(reserved.status, AttemptStatus.RESERVED)
+            self.assertEqual(paying.status, AttemptStatus.PAYING)
+            self.assertIsNotNone(paying.payment_attempted_at)
+            self.assertEqual(reconciling.status, AttemptStatus.RECONCILING)
+            self.assertEqual(ticketed.status, AttemptStatus.TICKETED)
+            self.assertEqual(final_trip.status, TripStatus.TICKETED)
 
 
 if __name__ == "__main__":
