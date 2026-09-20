@@ -3,7 +3,7 @@
 import argparse
 import os
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import date, time
 
 from .domain import Trip, TripStatus
@@ -77,7 +77,13 @@ def create_trip(store: TripStore, env: Mapping[str, str]) -> Trip:
     return store.create_trip(trip_from_env(env))
 
 
-def run_trip(store: TripStore, trip_id: int, env: Mapping[str, str]) -> Trip:
+def run_trip(
+    store: TripStore,
+    trip_id: int,
+    env: Mapping[str, str],
+    *,
+    stop_requested: Callable[[], bool] | None = None,
+) -> Trip:
     """저장된 여행 하나를 명시적 예약·실결제 승인으로 실행 또는 복구"""
     trip = store.get_trip(trip_id)
     if trip is None:
@@ -127,6 +133,7 @@ def run_trip(store: TripStore, trip_id: int, env: Mapping[str, str]) -> Trip:
             trip_id,
             interval_seconds=interval_seconds,
             max_polls=max_polls,
+            stop_requested=stop_requested,
         )
     finally:
         close_client(client)

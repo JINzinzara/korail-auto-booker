@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from korail_booker.app import main
+from korail_booker.desktop import booking_environment, save_keychain_secrets
 from korail_booker.domain import TripStatus
 from korail_booker.storage import TripStore
 
@@ -76,7 +77,12 @@ class ApplicationTest(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(trip.status, TripStatus.MONITORING)
-        worker.poll.assert_called_once_with(1, interval_seconds=5.0, max_polls=1)
+        worker.poll.assert_called_once_with(
+            1,
+            interval_seconds=5.0,
+            max_polls=1,
+            stop_requested=None,
+        )
         client.logout.assert_called_once_with()
         client.close.assert_called_once_with()
         printed = output.getvalue()
@@ -113,4 +119,21 @@ class ApplicationTest(unittest.TestCase):
             "실결제 승인 차단",
             "입력: 실결제 승인 없음",
             "출력: client 생성·로그인·예약·결제 0회",
+        )
+
+    def test_desktop_uses_keychain_and_explicit_live_approvals(self) -> None:
+        """화면 입력이 Keychain 저장과 승인된 기존 실행 계약으로 변환되는지 확인"""
+        values = environment(Path("desktop.sqlite3"), live=True)
+        with patch("korail_booker.desktop.keychain_set") as keychain_set:
+            save_keychain_secrets(values)
+        result = booking_environment(values, Path("desktop.sqlite3"))
+
+        self.assertEqual(keychain_set.call_count, 6)
+        self.assertEqual(result["KORAIL_RESERVE_APPROVED"], "1")
+        self.assertEqual(result["KORAIL_REAL_CHARGE_APPROVED"], "1")
+        show_flow(
+            "데스크톱 보안 입력",
+            "입력: 계정·개인카드와 여행 조건",
+            "저장: macOS Keychain 6개 항목",
+            "출력: 기존 create·run 계약과 예약·실결제 승인",
         )
