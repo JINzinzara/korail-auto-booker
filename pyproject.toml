@@ -8,5 +8,8 @@ version = "0.0.0"
 requires-python = ">=3.11"
 dependencies = ["korail-mobile-api @ git+https://github.com/yakisoba0728/korail-mobile-api@e798fbcf08e56297b4d16a5c300bd7a4f167722d"]
 
+[project.scripts]
+korail-booker = "korail_booker.app:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]

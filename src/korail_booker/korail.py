@@ -131,9 +131,7 @@ def reserve_live(
     *,
     approved: bool = False,
 ) -> Reservation:
-) -> Reservation:
     """명시적 승인과 운임 상한을 확인하고 결제 전 실예약을 반환"""
-    hold, confirmed_amount = _reserve_live(
     hold, confirmed_amount = _reserve_live(
         client,
         trip,
@@ -157,12 +155,10 @@ def reserve_live(
 def pay_reservation_live(
     client: korail.KorailClient,
     reservation: Reservation,
-    reservation: Reservation,
     card: korail.CardPayment,
     max_fare_won: int,
     *,
     real_charge_approved: bool = False,
-) -> bool:
 ) -> bool:
     """실카드 일회성 승인과 운임 재검증 뒤 예약을 한 번 결제"""
     if real_charge_approved is not True:
@@ -188,7 +184,6 @@ def pay_reservation_live(
         )
     except Exception as error:
         raise PaymentOutcomeUnknownError(
-        raise PaymentOutcomeUnknownError(
             "payment outcome is unknown; reconcile before retrying"
         ) from error
     if not isinstance(response, korail.ReservationPaymentResponse):
@@ -202,11 +197,8 @@ def pay_reservation_live(
         _cancel_unpaid(client, hold)
         return False
     return True
-        return False
-    return True
 
 
-def ticket_is_issued(client: korail.KorailClient, reservation: Reservation) -> bool:
 def ticket_is_issued(client: korail.KorailClient, reservation: Reservation) -> bool:
     """현재 승차권 목록에서 지정 예약번호의 발권 여부를 확인"""
     return _pnr_present(client.get_ticket_list().raw, reservation.reference)
