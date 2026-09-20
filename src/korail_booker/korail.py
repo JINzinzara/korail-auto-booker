@@ -1,5 +1,6 @@
 """DynaPath 사용 KORAIL 조회와 내부 여행 후보 변환"""
 
+import os
 from datetime import datetime, timedelta
 
 import korail_mobile_api as korail
@@ -19,6 +20,50 @@ from .worker import BookingWorker
 def create_client() -> korail.KorailClient:
     """라이브러리 지원 DynaPath를 활성화한 KORAIL client 생성"""
     return korail.KorailClient(korail.KorailConfig(enable_dynapath=True))
+
+
+def create_live_client() -> korail.KorailClient:
+    """승인 환경과 고정 기기 정보로 실제 KORAIL client 생성"""
+    if os.environ.get("KORAIL_MOBILE_API_LIVE") != "1":
+        raise PermissionError("KORAIL_MOBILE_API_LIVE=1 is required")
+    return korail.KorailClient(korail.build_config_from_env())
+
+
+def close_client(client: korail.KorailClient) -> None:
+    """서버 로그인 세션과 로컬 HTTP 연결을 순서대로 종료"""
+    try:
+        client.logout()
+    finally:
+        client.close()
+
+
+def create_adult_passengers(count: int) -> korail.KorailPassengerCounts:
+    """성인 인원수를 KORAIL 예약용 승객 구성으로 변환"""
+    return korail.KorailPassengerCounts(adult=count)
+
+
+def create_card_payment(
+    card_number: str,
+    card_password: str,
+    card_expire: str,
+    birthday: str,
+) -> korail.CardPayment:
+    """검증한 개인카드 입력을 로그나 저장소를 거치지 않고 생성"""
+    fields = {
+        "card number": (card_number, None),
+        "card password": (card_password, 2),
+        "card expiry": (card_expire, 4),
+        "birthday": (birthday, 6),
+    }
+    for name, (value, length) in fields.items():
+        if not value.isdecimal() or (length is not None and len(value) != length):
+            raise ValueError(f"{name} has an invalid format")
+    return korail.CardPayment(
+        card_number=card_number,
+        card_password=card_password,
+        card_expire=card_expire,
+        birthday=birthday,
+    )
 
 
 def login_client(
