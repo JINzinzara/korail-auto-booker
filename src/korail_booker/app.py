@@ -1,9 +1,10 @@
 """보안(카드, 비밀번호) 입력을 KORAIL 자동 예매 실행으로 연결"""
 
 import argparse
+import getpass
 import os
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date, time
 
 from .domain import Trip, TripStatus
@@ -46,6 +47,14 @@ def _approval(env: Mapping[str, str], name: str) -> None:
         raise PermissionError(f"{name}=1 is required")
 
 
+def _secret(env: Mapping[str, str], name: str, prompt: str) -> str:
+    """환경변수가 없으면 터미널 숨김 입력으로 비밀값을 읽기"""
+    value = env.get(name, "").strip() or getpass.getpass(f"{prompt}: ").strip()
+    if not value:
+        raise ValueError(f"{name} is required")
+    return value
+
+
 def trip_from_env(env: Mapping[str, str]) -> Trip:
     """비밀정보가 없는 환경변수에서 새 여행 조건을 생성"""
     try:
@@ -77,13 +86,7 @@ def create_trip(store: TripStore, env: Mapping[str, str]) -> Trip:
     return store.create_trip(trip_from_env(env))
 
 
-def run_trip(
-    store: TripStore,
-    trip_id: int,
-    env: Mapping[str, str],
-    *,
-    stop_requested: Callable[[], bool] | None = None,
-) -> Trip:
+def run_trip(store: TripStore, trip_id: int, env: Mapping[str, str]) -> Trip:
     """저장된 여행 하나를 명시적 예약·실결제 승인으로 실행 또는 복구"""
     trip = store.get_trip(trip_id)
     if trip is None:
@@ -107,13 +110,13 @@ def run_trip(
     )
     passengers = create_adult_passengers(trip.passenger_count)
     card = create_card_payment(
-        _required(env, "KORAIL_CARD_NUMBER"),
-        _required(env, "KORAIL_CARD_PASSWORD"),
-        _required(env, "KORAIL_CARD_EXPIRE"),
-        _required(env, "KORAIL_CARD_BIRTHDAY"),
+        _secret(env, "KORAIL_CARD_NUMBER", "카드번호"),
+        _secret(env, "KORAIL_CARD_PASSWORD", "카드 비밀번호 앞 2자리"),
+        _secret(env, "KORAIL_CARD_EXPIRE", "카드 유효기간 YYMM"),
+        _secret(env, "KORAIL_CARD_BIRTHDAY", "생년월일 YYMMDD"),
     )
     member_no = _required(env, "KORAIL_MEMBER_NO")
-    password = _required(env, "KORAIL_PASSWORD")
+    password = _secret(env, "KORAIL_PASSWORD", "코레일 비밀번호")
 
     client = create_live_client()
     try:
@@ -133,7 +136,6 @@ def run_trip(
             trip_id,
             interval_seconds=interval_seconds,
             max_polls=max_polls,
-            stop_requested=stop_requested,
         )
     finally:
         close_client(client)

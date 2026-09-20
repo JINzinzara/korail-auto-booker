@@ -9,8 +9,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from korail_booker.app import main
-from korail_booker.desktop import booking_environment, save_keychain_secrets
+from korail_booker.app import _secret, main
 from korail_booker.domain import TripStatus
 from korail_booker.storage import TripStore
 
@@ -77,12 +76,7 @@ class ApplicationTest(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(trip.status, TripStatus.MONITORING)
-        worker.poll.assert_called_once_with(
-            1,
-            interval_seconds=5.0,
-            max_polls=1,
-            stop_requested=None,
-        )
+        worker.poll.assert_called_once_with(1, interval_seconds=5.0, max_polls=1)
         client.logout.assert_called_once_with()
         client.close.assert_called_once_with()
         printed = output.getvalue()
@@ -121,19 +115,22 @@ class ApplicationTest(unittest.TestCase):
             "출력: client 생성·로그인·예약·결제 0회",
         )
 
-    def test_desktop_uses_keychain_and_explicit_live_approvals(self) -> None:
-        """화면 입력이 Keychain 저장과 승인된 기존 실행 계약으로 변환되는지 확인"""
-        values = environment(Path("desktop.sqlite3"), live=True)
-        with patch("korail_booker.desktop.keychain_set") as keychain_set:
-            save_keychain_secrets(values)
-        result = booking_environment(values, Path("desktop.sqlite3"))
+    def test_secret_uses_environment_or_hidden_prompt(self) -> None:
+        """비밀값을 환경변수에서 우선 읽고 없으면 숨김 입력하는지 확인"""
+        with patch(
+            "korail_booker.app.getpass.getpass", return_value="prompt-secret"
+        ) as prompt:
+            from_prompt = _secret({}, "SECRET", "비밀값")
+            from_environment = _secret(
+                {"SECRET": "environment-secret"}, "SECRET", "비밀값"
+            )
 
-        self.assertEqual(keychain_set.call_count, 6)
-        self.assertEqual(result["KORAIL_RESERVE_APPROVED"], "1")
-        self.assertEqual(result["KORAIL_REAL_CHARGE_APPROVED"], "1")
+        self.assertEqual(from_prompt, "prompt-secret")
+        self.assertEqual(from_environment, "environment-secret")
+        prompt.assert_called_once_with("비밀값: ")
         show_flow(
-            "데스크톱 보안 입력",
-            "입력: 계정·개인카드와 여행 조건",
-            "저장: macOS Keychain 6개 항목",
-            "출력: 기존 create·run 계약과 예약·실결제 승인",
+            "운영체제 독립 비밀 입력",
+            "입력: 환경변수 또는 터미널 숨김 입력",
+            "출력: 메모리에서만 사용하는 비밀번호·카드값",
+            "파일·Keychain 저장: 없음",
         )

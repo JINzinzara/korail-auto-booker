@@ -10,7 +10,6 @@ dependencies = ["korail-mobile-api @ git+https://github.com/yakisoba0728/korail-
 
 [project.scripts]
 korail-booker = "korail_booker.app:main"
-korail-booker-gui = "korail_booker.desktop:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
