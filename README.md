@@ -246,9 +246,16 @@ korail-auto-booker/
     └── test_worker.py
 ```
 
-## 아키텍처 개요
+## 아키텍처
 
-
+<p align="center">
+  <img
+    src="https://github.com/user-attachments/assets/9ba6003d-cc41-4f7b-8514-023307fcf62a"
+    alt="korail drawio"
+    width="755"
+    height="446"
+  />
+</p>
 
 주요 상태 흐름:
 
