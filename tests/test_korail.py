@@ -288,14 +288,15 @@ class KorailGatewayTest(unittest.TestCase):
         train = make_train()
         candidate = train_candidate(train)
         passengers = korail.KorailPassengerCounts(adult=2)
-        hold = korail.ReservationHoldResponse(
-            pnr_no="hidden", received_amount="118000"
-        )
+        hold = korail.ReservationHoldResponse(pnr_no="hidden", received_amount="118000")
         client = Mock(spec=korail.KorailClient)
         client.search_trains.return_value = korail.TrainSearchResult(
             trains=[train], response=korail.BaseKorailResponse()
         )
         client.reserve.return_value = hold
+        client.get_ticket_list.return_value = korail.BaseKorailResponse(
+            raw={"reservation_list": []}
+        )
         client.get_ticket_reservation_detail.return_value = (
             korail.TicketReservationDetailResponse(total_received_amount="000118000")
         )
@@ -333,14 +334,15 @@ class KorailGatewayTest(unittest.TestCase):
         """확정 운임이 승인 상한을 넘더라도 미결제 예약을 취소하는지 확인"""
         trip = make_trip()
         train = make_train()
-        hold = korail.ReservationHoldResponse(
-            pnr_no="hidden", received_amount="118000"
-        )
+        hold = korail.ReservationHoldResponse(pnr_no="hidden", received_amount="118000")
         client = Mock(spec=korail.KorailClient)
         client.search_trains.return_value = korail.TrainSearchResult(
             trains=[train], response=korail.BaseKorailResponse()
         )
         client.reserve.return_value = hold
+        client.get_ticket_list.return_value = korail.BaseKorailResponse(
+            raw={"reservation_list": []}
+        )
         client.get_ticket_reservation_detail.return_value = (
             korail.TicketReservationDetailResponse(total_received_amount="118000")
         )
@@ -375,6 +377,9 @@ class KorailGatewayTest(unittest.TestCase):
             trains=[train], response=korail.BaseKorailResponse()
         )
         client.reserve.return_value = make_hold()
+        client.get_ticket_list.return_value = korail.BaseKorailResponse(
+            raw={"reservation_list": []}
+        )
         client.get_ticket_reservation_detail.return_value = (
             korail.TicketReservationDetailResponse(total_received_amount="118000")
         )
@@ -526,16 +531,15 @@ class KorailGatewayTest(unittest.TestCase):
             )
             client.reserve.return_value = make_hold()
             client.get_ticket_reservation_detail.return_value = (
-                korail.TicketReservationDetailResponse(
-                    total_received_amount="118000"
-                )
+                korail.TicketReservationDetailResponse(total_received_amount="118000")
             )
             client.pay_with_card.return_value = korail.ReservationPaymentResponse(
                 str_result="SUCC"
             )
-            client.get_ticket_list.return_value = korail.BaseKorailResponse(
-                raw={"tickets": [{"h_pnr_no": "hidden"}]}
-            )
+            client.get_ticket_list.side_effect = [
+                korail.BaseKorailResponse(raw={"reservation_list": []}),
+                korail.BaseKorailResponse(raw={"tickets": [{"h_pnr_no": "hidden"}]}),
+            ]
             worker = create_live_worker(
                 store,
                 client,
@@ -560,7 +564,7 @@ class KorailGatewayTest(unittest.TestCase):
             self.assertEqual(client.search_trains.call_count, 2)
             client.reserve.assert_called_once()
             client.pay_with_card.assert_called_once()
-            client.get_ticket_list.assert_called_once()
+            self.assertEqual(client.get_ticket_list.call_count, 2)
 
 
 if __name__ == "__main__":
