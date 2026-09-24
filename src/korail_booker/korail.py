@@ -1,17 +1,31 @@
 """DynaPath 사용 KORAIL 조회와 내부 여행 후보 변환"""
 
 import os
+import re
+from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 import korail_mobile_api as korail
+from korail_mobile_api.constants import build_dalvik_user_agent
+from korail_mobile_api.dynapath import build_default_token_settings
+from korail_mobile_api.errors import (
+    KorailAppError,
+    KorailNoResultsError,
+    KorailServiceUnavailableError,
+    KorailSessionExpiredError,
+    KorailTransportError,
+)
 
 from .domain import (
     Candidate,
     PaymentOutcomeUnknownError,
     PurchaseAttempt,
     Reservation,
+    ReservationNotSentError,
     SeatOption,
     Trip,
+    normalize_station,
 )
 from .storage import TripStore
 from .worker import BookingWorker
@@ -22,19 +36,85 @@ def create_client() -> korail.KorailClient:
     return korail.KorailClient(korail.KorailConfig(enable_dynapath=True))
 
 
-def create_live_client() -> korail.KorailClient:
-    """승인 환경과 고정 기기 정보로 실제 KORAIL client 생성"""
-    if os.environ.get("KORAIL_MOBILE_API_LIVE") != "1":
+def create_live_client(
+    store: TripStore | None = None, env: Mapping[str, str] | None = None
+) -> korail.KorailClient:
+    """승인 환경과 설치별 고정 프로필로 실제 client 생성"""
+    env = os.environ if env is None else env
+    if env.get("KORAIL_MOBILE_API_LIVE") != "1":
         raise PermissionError("KORAIL_MOBILE_API_LIVE=1 is required")
-    return korail.KorailClient(korail.build_config_from_env())
+    if store is None:
+        return korail.KorailClient(korail.build_config_from_env())
+    settings = build_default_token_settings()
+    names = (
+        "KORAIL_DYNAPATH_DEVICE_ID",
+        "KORAIL_DYNAPATH_OS_VERSION",
+        "KORAIL_DYNAPATH_DEVICE_MODEL",
+    )
+    supplied = tuple(env.get(name, "").strip() for name in names)
+    if any(supplied) and not all(supplied):
+        raise ValueError("DynaPath overrides require all three device values")
+    profile = (
+        supplied
+        if all(supplied)
+        else store.device_profile(
+            (settings.device_id, settings.os_version, settings.device_model)
+        )
+    )
+    device_id, os_version, model = profile
+    if re.fullmatch(r"[0-9a-f]{16}", device_id) is None:
+        raise ValueError("DynaPath device ID must be 16 lowercase hex characters")
+    if not os_version or not model or any(c in os_version + model for c in "\r\n"):
+        raise ValueError("invalid DynaPath OS version or model")
+    if all(supplied):
+        store.device_profile(profile)
+    config = korail.KorailConfig(enable_dynapath=True)
+    settings = replace(
+        settings, device_id=device_id, os_version=os_version, device_model=model
+    )
+    config = replace(
+        config,
+        dynapath=replace(
+            config.dynapath,
+            token_settings=settings,
+            device_name=model,
+            os_version=os_version,
+        ),
+        user_agent=build_dalvik_user_agent(os_release=os_version, device_model=model),
+    )
+    return korail.KorailClient(config)
+
+
+def is_temporary_error(error: BaseException) -> bool:
+    """서버 혼잡·통신 오류·세션 만료만 자동 복구 대상으로 분류"""
+    while error is not None:
+        if isinstance(
+            error,
+            (
+                KorailTransportError,
+                KorailSessionExpiredError,
+                KorailServiceUnavailableError,
+            ),
+        ):
+            return True
+        if isinstance(error, KorailAppError) and error.code == "S002":
+            return True
+        error = error.__cause__
+    return False
 
 
 def close_client(client: korail.KorailClient) -> None:
     """서버 로그인 세션과 로컬 HTTP 연결을 순서대로 종료"""
     try:
         client.logout()
+    except Exception:
+        # 종료 실패가 이미 확정한 발권 결과나 원래 오류를 덮어쓰지 않게 한다.
+        pass
     finally:
-        client.close()
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 def create_adult_passengers(count: int) -> korail.KorailPassengerCounts:
@@ -88,8 +168,9 @@ def train_candidate(train: korail.TrainSummary) -> Candidate | None:
     """예약 가능한 KORAIL 열차 행을 내부 후보 하나로 변환"""
     if train.general_reservation_code == "11":
         seat_option = SeatOption.FULL
-    elif train.merge_seat_application_flag in (
-        korail.KORAIL_MERGE_SEAT_FLAGS_BY_CABIN["1"]
+    elif (
+        train.merge_seat_application_flag
+        in (korail.KORAIL_MERGE_SEAT_FLAGS_BY_CABIN["1"])
     ):
         seat_option = SeatOption.MERGE
     else:
@@ -249,6 +330,61 @@ def ticket_is_issued(client: korail.KorailClient, reservation: Reservation) -> b
     return _pnr_present(client.get_ticket_list().raw, reservation.reference)
 
 
+def ensure_no_conflicting_ticket(client: korail.KorailClient, trip: Trip) -> None:
+    """현재 승차권의 동일 방향 ±2일 여행을 예약 직전에 차단"""
+    try:
+        response = client.get_ticket_list()
+    except KorailNoResultsError as error:
+        if error.code in {"WRT300005", "WRG000000", "P114", "P100"}:
+            return
+        raise
+    if response.str_result == "FAIL":
+        raise KorailAppError(response.h_msg_cd, response.h_msg_txt)
+    raw = response.raw
+    if not isinstance(raw, dict):
+        raise ValueError("승차권 응답을 확인할 수 없어 예약을 중단합니다")
+    if "reservation_list" not in raw:
+        if raw.get("tickets") == [] or response.h_msg_cd in {
+            "WRT300005",
+            "WRG000000",
+            "P114",
+            "P100",
+        }:
+            return
+        raise ValueError("승차권 목록 형식이 변경되어 예약을 중단합니다")
+    # 고정 의존 버전의 TicketListDao: reservation_list → ticket_list → train_info.
+    groups = _ticket_children(raw, "reservation_list")
+    for group in groups:
+        for ticket in _ticket_children(group, "ticket_list"):
+            for train in _ticket_children(ticket, "train_info"):
+                try:
+                    departure = normalize_station(train["h_dpt_rs_stn_nm"])
+                    arrival = normalize_station(train["h_arv_rs_stn_nm"])
+                    day = datetime.strptime(train["h_dpt_dt"], "%Y%m%d").date()
+                    if not departure or not arrival:
+                        raise ValueError("empty station")
+                except (KeyError, TypeError, ValueError, AttributeError) as error:
+                    raise ValueError(
+                        "승차권의 역·날짜 확인 실패로 예약을 중단합니다"
+                    ) from error
+                if (
+                    departure == normalize_station(trip.departure_station)
+                    and arrival == normalize_station(trip.arrival_station)
+                    and abs((day - trip.travel_date).days) <= 2
+                ):
+                    raise ValueError(
+                        "KORAIL 계정에 같은 방향 ±2일 이내 승차권이 있습니다"
+                    )
+
+
+def _ticket_children(raw: dict, key: str) -> list[dict]:
+    """확인된 승차권 중첩 목록만 허용하고 알 수 없는 응답은 차단"""
+    rows = raw.get(key)
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ValueError("승차권 목록 형식이 변경되어 예약을 중단합니다")
+    return rows
+
+
 def create_live_worker(
     store: TripStore,
     client: korail.KorailClient,
@@ -263,10 +399,19 @@ def create_live_worker(
 
     def search(trip: Trip) -> tuple[Candidate, ...]:
         """worker 여행 조건으로 KORAIL 후보를 조회"""
-        return search_candidates(client, trip)
+        candidates = search_candidates(client, trip)
+        print(
+            f"{datetime.now():%H:%M:%S} trip_id={trip.id} MONITORING: 조회 완료",
+            flush=True,
+        )
+        return candidates
 
     def reserve(trip: Trip, candidate: Candidate) -> Reservation:
         """worker 후보를 승인된 실예약으로 확보"""
+        print(
+            f"trip_id={trip.id} 예약 시도: {candidate.train_no} {candidate.departure_at:%H:%M}",
+            flush=True,
+        )
         return reserve_live(
             client,
             trip,
@@ -280,6 +425,7 @@ def create_live_worker(
         """저장된 예약을 승인된 실카드로 한 번 결제"""
         if attempt.reservation is None:
             raise RuntimeError("payment attempt has no reservation")
+        print(f"trip_id={attempt.trip_id} RESERVED → PAYING", flush=True)
         return pay_reservation_live(
             client,
             attempt.reservation,
@@ -292,6 +438,7 @@ def create_live_worker(
         """저장된 예약이 현재 승차권 목록에 발권됐는지 조회"""
         if attempt.reservation is None:
             raise RuntimeError("ticket check has no reservation")
+        print(f"trip_id={attempt.trip_id} RECONCILING: 승차권 확인", flush=True)
         return ticket_is_issued(client, attempt.reservation)
 
     return BookingWorker(store, search, reserve, pay, verify)
@@ -311,14 +458,23 @@ def _reserve_live(
         raise PermissionError("live reservation requires explicit approval")
     _validate_max_fare(max_fare_won)
     _validate_reservation(trip, candidate, passengers)
-    train = _find_train(client, trip, candidate)
-    if train is None:
-        raise ValueError("candidate is no longer available")
-    hold = client.reserve(
-        train,
-        consent=korail.MutationConsent(allow_reserve=True, dry_run=False),
-        passengers=passengers,
-    )
+    try:
+        train = _find_train(client, trip, candidate)
+        if train is None:
+            raise ValueError("candidate is no longer available")
+        ensure_no_conflicting_ticket(client, trip)
+    except Exception as error:
+        raise ReservationNotSentError(str(error)) from error
+    try:
+        hold = client.reserve(
+            train,
+            consent=korail.MutationConsent(allow_reserve=True, dry_run=False),
+            passengers=passengers,
+        )
+    except KorailAppError as error:
+        if error.code == "S002":
+            raise ReservationNotSentError("S002: reservation rejected") from error
+        raise
     if not isinstance(hold, korail.ReservationHoldResponse) or not hold.pnr_no:
         raise RuntimeError("live reservation did not return a reservation hold")
     try:

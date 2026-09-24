@@ -36,6 +36,15 @@ class PaymentOutcomeUnknownError(RuntimeError):
     """결제 전송 후 서버 결과를 확정할 수 없음을 표시"""
 
 
+class ReservationNotSentError(RuntimeError):
+    """예약 미전송 또는 명시적 거절로 재조회가 안전함을 표시"""
+
+
+def normalize_station(value: str) -> str:
+    """공백과 역 접미사를 제거해 같은 역 이름을 일관되게 비교"""
+    return "".join(value.split()).removesuffix("역").casefold()
+
+
 @dataclass(frozen=True, slots=True)
 class Trip:
     departure_station: str
@@ -76,8 +85,15 @@ class Trip:
             raise ValueError("trip id must be an integer")
         if not self.departure_station.strip() or not self.arrival_station.strip():
             raise ValueError("departure and arrival stations are required")
-        if self.departure_station == self.arrival_station:
+        if normalize_station(self.departure_station) == normalize_station(
+            self.arrival_station
+        ):
             raise ValueError("departure and arrival stations must differ")
+        if any(
+            normalize_station(value).isdecimal()
+            for value in (self.departure_station, self.arrival_station)
+        ):
+            raise ValueError("역 코드 대신 역 이름을 입력해주세요")
         if self.earliest_departure > self.latest_departure:
             raise ValueError("earliest departure must not be after latest departure")
         if not self.train_types or any(not value.strip() for value in self.train_types):
