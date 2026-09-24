@@ -16,13 +16,13 @@
 - **중복 예약 및 결제 방지**: SQLite 트랜잭션을 통해 트레킹
 - **결제 오류 방지**: 결제 결과 불명확할 시, 재결재 방지하고 발권 여부부터 확인
 - **구매 완료 티켓 확인**: 프로세스 재시작 시, 저장된 예약 및 결제 상태 복구
+- **리셀 방지**: 동일 날짜·방향·출발시간 중복 / 같은 방향 노선 전후 2일 이내 중복 금지
+- **서버 오류 자동 재시작**: KORAIL 서버 오류 `S002` 발생 시 세션 재연결 후 모니터링 자동 재시작
 
 **현재 제한 사항**:<br>
 - 승객 종류 = 성인 (특가 상품 불가) 
 - 전 구간 일반 좌석
 - 웹 UI와 HTTP API는 제공하지 않음
-- 차후 기능 추가, 리셀 방지 규칙; 동일 날짜·방향·출발시간 중복 / 같은 방향 노선 전후 2일 이내 중복 금지
-- 차후 기능 추가, KORAIL 서버 오류 `S002` 발생 시 세션 재연결 후 모니터링 자동 재시작
 
 ## 기술 스택
 
@@ -39,190 +39,87 @@
 
 ## 빠른 시작
 
-### 사전 요구사항
+### Docker로 실행
 
-- Python 3.11 이상
-- Git
-- 인터넷 연결
-- 본인 KORAIL 계정
-- KORAIL 결제에 사용할 개인카드
-- 실제 Android 기기의 DynaPath 식별 정보
-- Python 버전 확인:
+Docker Desktop 또는 Docker Engine과 Compose 실행<br>
+소스 폴더 다운시, clone 단계 생략가능
 
-```bash
-python3 --version
 ```
-
-Windows:
-
-```powershell
-py --version
-```
-
-### 2. 소스 코드 받기
-
-GitHub:
-
-```bash
 git clone https://github.com/JINzinzara/korail-auto-booker.git
 cd korail-auto-booker
+docker compose run --build --rm booker
 ```
 
-*Hugging Face: repo 전체를 내려받아 압축을 풀고, 터미널에서 해당 폴더로 이동한 뒤 아래 설치 단계 진행*
+터미널 질문에 따라 응답 &rarr; 여행 정보 SQLite 저장<br>
+*첫 빌드는 의존성 다운로드로 인해 시간이 걸릴 수 있음*
 
-### 3. 설치
+```
+출발역: 서울
+도착역: 부산
+여행 날짜 YYYY-MM-DD: 2026-10-01
+출발 시작시각 HH:MM: 08:00
+출발 종료시각 HH:MM: 09:00
+열차 종류 (여러 개는 쉼표로 구분) [KTX]:
+성인 인원 [1]:
+trip_id=1 서울 → 부산 2026-10-01 08:00~09:00 성인 1명
+총 결제 상한 (원): 70000
+이 조건으로 자동 예약·실제 카드 결제를 승인합니까? yes/no [no]: yes
+KORAIL 회원번호 또는 로그인 ID: 본인 계정
+카드번호: (숨김 입력)
+카드 비밀번호 앞 2자리: (숨김 입력)
+카드 유효기간 YYMM: (숨김 입력)
+생년월일 YYMMDD: (숨김 입력)
+코레일 비밀번호: (숨김 입력)
+```
+
+승차권 조회 성공 시, `trip_id=... status=TICKETED` 출력하고 종료
+
+### 상태 확인·기존 여행 재개·중지
+
+```
+docker compose run --rm booker status
+docker compose run --rm booker run 2
+docker compose run --rm booker stop 2
+```
+
+`2`는 status에 표시된 실제 ID로 변환됨 (ID는 SQLite가 자동 발급).<br>
+재개는 같은 DB/volume을 사용<br>
+stop은 DRAFT/MONITORING만 중지하며, 예약 취소·환불 명령이 아님.
+
+### Python 실행
 
 macOS/Linux:
-
-```bash
+```
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install .
+korail-booker run
 ```
 
 Windows PowerShell:
-
-```powershell
+```
 py -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install .
+korail-booker run
 ```
 
-### 4. 여행(Trip) 조건 생성
-
-*`create`는 여행 조건을 검증하고 SQLite에 `DRAFT` 상태로 저장*
-
-macOS/Linux:
-
+```
 ```bash
-export KORAIL_DB_PATH="$PWD/korail-booker.sqlite3"
-export KORAIL_DEPARTURE_STATION="?"
-export KORAIL_ARRIVAL_STATION="?"
-export KORAIL_TRAVEL_DATE="?"
-export KORAIL_EARLIEST_DEPARTURE="?"
-export KORAIL_LATEST_DEPARTURE="?"
-export KORAIL_TRAIN_TYPES="?"
-export KORAIL_PASSENGER_COUNT="?"
-
-korail-booker create
+korail-booker status
+korail-booker run 2
+korail-booker stop 2
 ```
 
-Windows PowerShell:
+기본 DB = `korail-booker.sqlite3`
 
-```powershell
-$env:KORAIL_DB_PATH="$PWD\korail-booker.sqlite3"
-$env:KORAIL_DEPARTURE_STATION="?"
-$env:KORAIL_ARRIVAL_STATION="?"
-$env:KORAIL_TRAVEL_DATE="?"
-$env:KORAIL_EARLIEST_DEPARTURE="?"
-$env:KORAIL_LATEST_DEPARTURE="?"
-$env:KORAIL_TRAIN_TYPES="?"
-$env:KORAIL_PASSENGER_COUNT="?"
-
-korail-booker create
-```
-
-`?`를 실제 여행 조건으로 변경<br>
-여러 열차 종류는 쉼표로 구분(아래 코드 참조)
-
-```bash
-export KORAIL_TRAIN_TYPES="KTX,KTX-산천"
-```
-
-생성 결과:
-
-```text
-trip_id=1 status=DRAFT
-```
-
-### 5. 실제 조회·예약·결제 실행
-
-**실제 API 호출, 예약, 카드 결제 사용**<br>
-*`MAX_FARE_WON`: 승인 최대 결제 금액은 넉넉히 잡아주세요*
-
-```text
-KORAIL_MOBILE_API_LIVE=1
-KORAIL_RESERVE_APPROVED=1
-KORAIL_REAL_CHARGE_APPROVED=1
-```
-
-macOS/Linux:
-
-```bash
-export KORAIL_MOBILE_API_LIVE="1"
-export KORAIL_RESERVE_APPROVED="1"
-export KORAIL_REAL_CHARGE_APPROVED="1"
-
-export KORAIL_MAX_FARE_WON="?"
-export KORAIL_MEMBER_NO="본인의_KORAIL_회원번호"
-
-export KORAIL_DYNAPATH_DEVICE_ID="실제_16자리_소문자_hex"
-export KORAIL_DYNAPATH_OS_VERSION="15"
-export KORAIL_DYNAPATH_DEVICE_MODEL="실제_Android_기기_모델"
-
-korail-booker run 1
-```
-
-Windows PowerShell:
-
-```powershell
-$env:KORAIL_MOBILE_API_LIVE="1"
-$env:KORAIL_RESERVE_APPROVED="1"
-$env:KORAIL_REAL_CHARGE_APPROVED="1"
-
-$env:KORAIL_MAX_FARE_WON="?"
-$env:KORAIL_MEMBER_NO="본인의_KORAIL_회원번호"
-
-$env:KORAIL_DYNAPATH_DEVICE_ID="실제_16자리_소문자_hex"
-$env:KORAIL_DYNAPATH_OS_VERSION="15"
-$env:KORAIL_DYNAPATH_DEVICE_MODEL="실제_Android_기기_모델"
-
-korail-booker run 1
-```
-
-*DynaPath 값에는 임의의 예시값이 아닌 실제 Android 기기 정보를 입력*
-
-- `KORAIL_DYNAPATH_DEVICE_ID`: Android ID, 소문자 16자리 16진수
-- `KORAIL_DYNAPATH_OS_VERSION`: Android 버전 예: `15`
-- `KORAIL_DYNAPATH_DEVICE_MODEL`: 실제 기기 모델 예: `SM-S928N`
-
-*아래의 정보는 `read -s` 할 것을 권장*
-
-- KORAIL 비밀번호
-- 카드번호
-- 카드 비밀번호 앞 2자리
-- 카드 유효기간 `YYMM`
-- 생년월일 `YYMMDD`
-
-실행 중 좌석이 발견 시 workflow:
-
-1. 최신 좌석 재확인
-2. 예약 생성
-3. 예약 운임과 `KORAIL_MAX_FARE_WON` 비교
-4. 카드 결제 1회 실행
-5. 승차권 목록에서 발권 여부 확인
-
-### 6. 조회 횟수와 간격 조정
-
-**조회 간격: 10s ~ 5s**
-
-```bash
-export KORAIL_POLL_INTERVAL_SECONDS="10"
-```
-
-조회 횟수를 제한하려면 다음 값 조정
-
-```bash
-export KORAIL_MAX_POLLS="6"
-```
-
-`KORAIL_MAX_POLLS`를 설정하지 않으면 발권되거나 오류로 종료될 때까지 무한 조회 루프
-
-조회 횟수가 끝났지만 여행 상태가 `MONITORING`이라면 같은 `trip_id`로 재실행 가능
-
-```bash
-korail-booker run 1
-```
+### 오류 발생 시
+- `S002` 등 일시적 오류: 안내된 시간만큼 대기한 뒤 재접속
+- 재접속 횟수 소진: 원래 오류를 출력하고 종료. 기본 5회이며 `KORAIL_MAX_RESTARTS`로 조정 가능
+- 로그인 정보 오류·응답 형식 오류: 자동 반복하지 않고 종료
+- `CLAIMING`: 예약 결과 확인 필요
+- `PAYING/RECONCILING`: 같은 ID를 재개 시, 승차권을 확인하며 자동 재결제하지 않음
+- Ctrl+C: 프로세스 종료. 재시작은 status 확인 후 같은 ID 사용. 컨테이너/PC 종료 후 자동 프로세스 재시작은 제공하지 않음
 
 ## 폴더 구조
 
