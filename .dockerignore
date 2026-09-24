@@ -1,0 +1,6 @@
+# 자격정보·SQLite·이전 빌드가 빌드 컨텍스트에 포함되지 않게 허용 목록 사용.
+**
+!pyproject.toml
+!src/
+!src/korail_booker/
+!src/korail_booker/*.py

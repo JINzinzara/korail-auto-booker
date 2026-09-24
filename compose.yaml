@@ -1,0 +1,11 @@
+# docker compose run --rm booker 한 번으로 질문부터 감시까지 실행.
+services:
+  booker:
+    build: .
+    stdin_open: true
+    tty: true
+    init: true
+    volumes:
+      - booker-data:/data
+volumes:
+  booker-data:
