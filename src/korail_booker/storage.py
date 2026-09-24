@@ -15,6 +15,7 @@ from .domain import (
     Reservation,
     Trip,
     TripStatus,
+    normalize_station,
 )
 
 
@@ -51,6 +52,12 @@ class TripStore:
                 CREATE UNIQUE INDEX IF NOT EXISTS one_active_attempt_per_trip
                 ON purchase_attempts(trip_id)
                 WHERE status NOT IN ('TICKETED', 'FAILED');
+                CREATE TABLE IF NOT EXISTS device_profile (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    device_id TEXT NOT NULL,
+                    os_version TEXT NOT NULL,
+                    device_model TEXT NOT NULL
+                );
                 """)
             columns = {
                 row[1]
@@ -65,6 +72,7 @@ class TripStore:
     def _connect(self) -> Iterator[sqlite3.Connection]:
         """외래 키를 활성화하고 transaction 뒤 연결을 항상 종료"""
         connection = sqlite3.connect(self.path)
+        connection.create_function("station", 1, normalize_station, deterministic=True)
         connection.execute("PRAGMA foreign_keys = ON")
         try:
             with connection:
@@ -77,6 +85,8 @@ class TripStore:
         if trip.id is not None or trip.status is not TripStatus.DRAFT:
             raise ValueError("only a new draft trip can be created")
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._check_conflict(connection, trip)
             cursor = connection.execute(
                 """
                 INSERT INTO trips (
@@ -99,6 +109,37 @@ class TripStore:
                 ),
             )
         return replace(trip, id=cursor.lastrowid)
+
+    def _check_conflict(self, connection: sqlite3.Connection, trip: Trip) -> None:
+        """동일 방향의 전후 2일 내 초안·활성·발권 여행을 원자적으로 차단"""
+        row = connection.execute(
+            """
+            SELECT id FROM trips
+            WHERE station(departure_station) = station(?)
+              AND station(arrival_station) = station(?)
+              AND abs(julianday(travel_date) - julianday(?)) <= 2
+              AND status NOT IN ('FAILED', 'STOPPED')
+              AND id != ? LIMIT 1
+            """,
+            (
+                trip.departure_station,
+                trip.arrival_station,
+                trip.travel_date.isoformat(),
+                trip.id or 0,
+            ),
+        ).fetchone()
+        if row is not None:
+            raise ValueError(f"같은 방향 ±2일 내 여행이 있습니다: trip_id={row[0]}")
+
+    def device_profile(self, defaults: tuple[str, str, str]) -> tuple[str, str, str]:
+        """설치별 비밀정보 없는 기기 프로필을 최초 한 번 저장하고 재사용"""
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO device_profile VALUES (1, ?, ?, ?)", defaults
+            )
+            return connection.execute(
+                "SELECT device_id, os_version, device_model FROM device_profile WHERE id = 1"
+            ).fetchone()
 
     def get_trip(self, trip_id: int) -> Trip | None:
         """ID로 여행을 조회하고 없으면 None"""
@@ -126,6 +167,15 @@ class TripStore:
             allow_merge_seat=bool(row[8]),
             status=TripStatus(row[9]),
         )
+
+    def list_trips(self, trip_id: int | None = None) -> list[Trip]:
+        """저장된 여행 ID와 상태를 확인할 목록 반환"""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id FROM trips WHERE ? IS NULL OR id = ? ORDER BY id DESC",
+                (trip_id, trip_id),
+            ).fetchall()
+        return [self.get_trip(row[0]) for row in rows]
 
     def get_attempt(self, attempt_id: int) -> PurchaseAttempt | None:
         """ID로 구매 시도를 조회하고 없으면 None"""
@@ -175,6 +225,11 @@ class TripStore:
     def start_trip(self, trip_id: int) -> bool:
         """DRAFT 여행을 MONITORING으로 한 번만 전환"""
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            trip = self.get_trip(trip_id)
+            if trip is None:
+                return False
+            self._check_conflict(connection, trip)
             cursor = connection.execute(
                 "UPDATE trips SET status = ? WHERE id = ? AND status = ?",
                 (TripStatus.MONITORING.value, trip_id, TripStatus.DRAFT.value),
@@ -182,11 +237,11 @@ class TripStore:
         return cursor.rowcount == 1
 
     def stop_trip(self, trip_id: int) -> bool:
-        """아직 구매를 시작하지 않은 MONITORING 여행을 STOPPED로 전환"""
+        """아직 구매를 시작하지 않은 초안 또는 감시 여행을 중지"""
         with self._connect() as connection:
             cursor = connection.execute(
-                "UPDATE trips SET status = ? WHERE id = ? AND status = ?",
-                (TripStatus.STOPPED.value, trip_id, TripStatus.MONITORING.value),
+                "UPDATE trips SET status = ? WHERE id = ? AND status IN ('DRAFT', 'MONITORING')",
+                (TripStatus.STOPPED.value, trip_id),
             )
         return cursor.rowcount == 1
 
@@ -197,6 +252,10 @@ class TripStore:
         now = datetime.now(timezone.utc)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            trip = self.get_trip(trip_id)
+            if trip is None:
+                return None
+            self._check_conflict(connection, trip)
             duplicate = connection.execute(
                 """
                 SELECT 1 FROM purchase_attempts
@@ -231,6 +290,25 @@ class TripStore:
             candidate_key=candidate.key,
             created_at=now,
         )
+
+    def release_unsent_reservation(self, attempt_id: int) -> None:
+        """예약 미전송이 확인된 claim만 해제해 같은 후보의 재조회를 허용"""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT trip_id FROM purchase_attempts WHERE id = ? "
+                "AND status = 'RESERVING' AND reservation_json IS NULL "
+                "AND payment_attempted_at IS NULL",
+                (attempt_id,),
+            ).fetchone()
+            if row is not None:
+                connection.execute(
+                    "DELETE FROM purchase_attempts WHERE id = ?", (attempt_id,)
+                )
+                connection.execute(
+                    "UPDATE trips SET status = 'MONITORING' WHERE id = ? AND status = 'CLAIMING'",
+                    row,
+                )
 
     def start_reservation(self, attempt_id: int) -> PurchaseAttempt | None:
         """CLAIMED 구매 시도의 예약 호출을 한 번만 시작"""

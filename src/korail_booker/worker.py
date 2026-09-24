@@ -9,6 +9,7 @@ from .domain import (
     PaymentOutcomeUnknownError,
     PurchaseAttempt,
     Reservation,
+    ReservationNotSentError,
     Trip,
     TripStatus,
 )
@@ -50,7 +51,11 @@ class BookingWorker:
         reserving = self.store.start_reservation(claimed.id)
         if reserving is None:
             return None
-        reservation = self.reserve(trip, candidate)
+        try:
+            reservation = self.reserve(trip, candidate)
+        except ReservationNotSentError:
+            self.store.release_unsent_reservation(claimed.id)
+            raise
         if reservation is None:
             return self.store.retry_after_reservation_failure(claimed.id)
         reserved = self.store.mark_reserved(claimed.id, reservation)
